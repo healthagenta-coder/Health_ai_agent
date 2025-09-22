@@ -36,8 +36,6 @@ def init_connection():
         database="Health_med",
         user="neondb_owner",
         password="npg_5GXIK6DrVLHU",
-        sslmode="require",
-        options="-c channel_binding=require",
         cursor_factory=RealDictCursor
 )
         return conn
@@ -998,3 +996,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
