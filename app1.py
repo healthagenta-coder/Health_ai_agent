@@ -178,6 +178,10 @@ if "uploader_version" not in st.session_state:
     st.session_state.uploader_version = 0
 if "upload_processing" not in st.session_state:
     st.session_state.upload_processing = False
+if "pending_phone" not in st.session_state:
+    st.session_state.pending_phone = ""
+if "show_create_family" not in st.session_state:
+    st.session_state.show_create_family = False
 
 # Utility functions
 def extract_text_from_pdf(uploaded_file):
@@ -953,14 +957,37 @@ def main():
                             })
                             st.rerun()
                         else:
-                            st.session_state.registration_step = 1
-                            st.session_state.chat_history.append({
-                                "role": "assistant", 
-                                "content": "I couldn't find your family profile. Please register with your family information."
-                            })
-                            st.rerun()
+                            # Prompt to create a profile for this phone number
+                            st.session_state.pending_phone = phone_number
+                            st.session_state.show_create_family = True
+                            st.info("No profile found for this phone. Create a profile below.")
                     else:
                         st.error("Please enter a phone number")
+            
+            # Inline create-profile flow when phone not found
+            if st.session_state.show_create_family and st.session_state.pending_phone:
+                with st.form("create_family_inline", clear_on_submit=True):
+                    st.subheader("Create Profile")
+                    head_name = st.text_input("Head of Family Name", placeholder="Enter the head of family name")
+                    region = st.text_input("Region/City (optional)", placeholder="Enter your city/region (optional)")
+                    if st.form_submit_button("Create Profile"):
+                        if head_name:
+                            family = create_family(st.session_state.pending_phone, head_name, region)
+                            if family:
+                                st.session_state.current_family = family
+                                st.session_state.show_create_family = False
+                                st.session_state.pending_phone = ""
+                                # Move directly to adding a member
+                                st.session_state.registration_step = 2
+                                st.session_state.chat_history.append({
+                                    "role": "assistant",
+                                    "content": f"Welcome {head_name}! Profile created. Please add your first family member."
+                                })
+                                st.rerun()
+                            else:
+                                st.error("Failed to create profile. Please try again.")
+                        else:
+                            st.error("Please enter the head of family name.")
     
     # Render sidebar
     render_sidebar()
@@ -994,6 +1021,4 @@ def main():
             render_registration_form()
 
 if __name__ == "__main__":
-
     main()
-
