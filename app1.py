@@ -32,12 +32,14 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-            host="localhost",
-            database="Health_med",
-            user="postgres",
-            password="jeet",
-            cursor_factory=RealDictCursor
-        )
+        host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+        database="Health_med",
+        user="neondb_owner",
+        password="npg_5GXIK6DrVLHU",
+        sslmode="require",
+        options="-c channel_binding=require",
+        cursor_factory=RealDictCursor
+)
         return conn
     except Exception as e:
         st.error(f"Database connection failed: {e}")
@@ -994,4 +996,5 @@ def main():
             render_registration_form()
 
 if __name__ == "__main__":
+
     main()
