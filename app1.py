@@ -570,10 +570,13 @@ def handle_profile_selection(selection):
             st.session_state.bot_state = "welcome"
 
 def parse_name_age_sex(input_text):
-    """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya, 4, F'"""
+    """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya 4 Female'"""
     try:
-        parts = [part.strip() for part in input_text.split(',')]
-        name = parts[0]
+        # Split by commas or spaces
+        parts = re.split(r'[,\s]+', input_text.strip())
+        parts = [p.strip() for p in parts if p.strip()]
+
+        name = parts[0] if parts else "Unknown"
         age = 25  # default age
         
         # Find age in the parts
@@ -582,7 +585,6 @@ def parse_name_age_sex(input_text):
                 age = int(part)
                 break
             elif any(char.isdigit() for char in part):
-                # Extract digits from string like "26 years"
                 age_str = ''.join(filter(str.isdigit, part))
                 if age_str:
                     age = int(age_str)
@@ -590,7 +592,7 @@ def parse_name_age_sex(input_text):
         
         # Find gender (M/F/Male/Female)
         sex = 'Other'  # default
-        for part in parts:
+        for part in parts[1:]:
             part_lower = part.lower()
             if part_lower in ['m', 'male', 'boy', 'man']:
                 sex = 'Male'
@@ -598,10 +600,10 @@ def parse_name_age_sex(input_text):
             elif part_lower in ['f', 'female', 'girl', 'woman']:
                 sex = 'Female'
                 break
-        print(name,age,sex)
+        
+        print(name, age, sex)
         return name, age, sex
-    except:
-        # Fallback if parsing fails
+    except Exception as e:
         return input_text.strip(), 25, 'Other'
 
 def handle_name_age_input(name_age_text):
@@ -941,4 +943,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
