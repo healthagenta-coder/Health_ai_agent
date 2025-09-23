@@ -32,12 +32,12 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-        host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
-)
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
+        )
         return conn
     except Exception as e:
         st.error(f"Database connection failed: {e}")
@@ -50,6 +50,9 @@ def init_db():
     if conn is not None:
         try:
             with conn.cursor() as cur:
+                # Rollback any existing transaction first
+                conn.rollback()
+                
                 # Create families table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS families (
@@ -146,42 +149,47 @@ def init_db():
                     )
                 """)
                 
+                # Create symptoms table for symptom tracking
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS symptoms (
+                        id SERIAL PRIMARY KEY,
+                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+                        symptoms_text TEXT NOT NULL,
+                        severity INTEGER,
+                        reported_date DATE DEFAULT CURRENT_DATE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
                 conn.commit()
         except Exception as e:
+            # Rollback on error and show detailed error
+            conn.rollback()
             st.error(f"Database initialization failed: {e}")
-
 init_db()
 
 # Session state initialization
-if "current_family" not in st.session_state:
-    st.session_state.current_family = None
-if "current_member" not in st.session_state:
-    st.session_state.current_member = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "registration_step" not in st.session_state:
-    st.session_state.registration_step = 0
-if "new_member_data" not in st.session_state:
-    st.session_state.new_member_data = {
-        "name": "", "age": "", "sex": "", "family_history": "",
-        "habits": [], "diseases": []
+def init_session_state():
+    defaults = {
+        "current_family": None,
+        "current_profiles": [],  # List of family members
+        "chat_history": [],
+        "bot_state": "welcome",  # welcome, awaiting_symptom_input, awaiting_profile_selection, awaiting_report, awaiting_name_age
+        "temp_symptoms": "",
+        "temp_report": None,
+        "temp_report_text": "",
+        "awaiting_profile_choice": False,
+        "pending_action": None,  # "symptom", "report"
+        "temp_name_age": "",
+        "create_family_mode": False,
+        "pending_phone": ""
     }
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "file_processed" not in st.session_state:
-    st.session_state.file_processed = False
-if "show_health_form" not in st.session_state:
-    st.session_state.show_health_form = False  # deprecated, retained for backward compatibility
-if "current_report_text" not in st.session_state:
-    st.session_state.current_report_text = ""
-if "uploader_version" not in st.session_state:
-    st.session_state.uploader_version = 0
-if "upload_processing" not in st.session_state:
-    st.session_state.upload_processing = False
-if "pending_phone" not in st.session_state:
-    st.session_state.pending_phone = ""
-if "show_create_family" not in st.session_state:
-    st.session_state.show_create_family = False
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
 
 # Utility functions
 def extract_text_from_pdf(uploaded_file):
@@ -195,144 +203,150 @@ def extract_text_from_pdf(uploaded_file):
         st.error(f"Error reading PDF: {e}")
         return ""
 
-def get_health_score_from_gemini(report_text, member_data, report_data):
-    if not GEMINI_AVAILABLE:
+def get_previous_insights(member_id, limit=3):
+    """Get previous insights for sequential analysis"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT insight_text, created_at 
+                FROM insight_history 
+                WHERE member_id = %s 
+                ORDER BY created_at DESC 
+                LIMIT %s
+            """, (member_id, limit))
+            return cur.fetchall()
+    except Exception as e:
+        st.error(f"Error fetching previous insights: {e}")
+        return []
+
+def save_insight(member_id, report_id, insight_text):
+    """Save insight to insight_history table"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO insight_history (member_id, report_id, insight_text) 
+                VALUES (%s, %s, %s) RETURNING *
+            """, (member_id, report_id, insight_text))
+            conn.commit()
+            return cur.fetchone()
+    except Exception as e:
+        st.error(f"Error saving insight: {e}")
         return None
+
+def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None, region=None, member_id=None):
+    """Get symptom analysis from Gemini AI with sequential context"""
+    if not GEMINI_AVAILABLE:
+        return get_simple_symptom_analysis(symptoms_text), None
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # Get member habits and diseases
-        habits = get_member_habits(member_data['id'])
-        diseases = get_member_diseases(member_data['id'])
-        
-        # Calculate upload frequency
-        upload_count = get_upload_frequency(member_data['id'])
+        # Get previous insights for sequential analysis
+        previous_insights_context = ""
+        if member_id:
+            previous_insights = get_previous_insights(member_id)
+            if previous_insights:
+                previous_insights_context = "\n\nPREVIOUS INSIGHTS FOR CONTEXT:\n"
+                for i, insight in enumerate(previous_insights, 1):
+                    previous_insights_context += f"{i}. {insight['insight_text']}\n"
         
         prompt = f"""
-        Analyze this medical report and calculate health scores for each category out of 100.
+        Analyze these symptoms and provide a brief, helpful analysis (2-3 sentences max):
         
-        PATIENT INFO:
-        - Age: {member_data['age']}
-        - Sex: {member_data['sex']}
-        - Family History: {member_data.get('family_history', 'None provided')}
-        - Known Diseases: {[d['disease_name'] for d in diseases] if diseases else 'None'}
-        - Habits: {[f"{h['habit_type']}: {h['habit_value']}" for h in habits] if habits else 'None'}
-        - Upload Frequency: {upload_count} reports uploaded
+        Symptoms: {symptoms_text}
+        Patient Age: {member_age if member_age else 'Not specified'}
+        Patient Sex: {member_sex if member_sex else 'Not specified'}
+        Region: {region if region else 'Not specified'}
+        {previous_insights_context}
         
-        CURRENT REPORT DATA:
-        - Symptom Severity (1-10): {report_data.get('symptom_severity', 'Not provided')}
-        - Symptom Trend: {report_data.get('symptom_trend', 'Not provided')}
-        - Treatment Adherence (1-10): {report_data.get('treatment_adherence', 'Not provided')}
-        - Medications Followed (%): {report_data.get('meds_followed_percent', 'Not provided')}
-        - Vaccinations Up to Date: {report_data.get('vaccinations_done', 'Not provided')}
-        - Activity Level (1-10): {report_data.get('activity_level', 'Not provided')}
-        - Sleep Hours: {report_data.get('sleep_hours', 'Not provided')}
-        - Nutrition Score (1-10): {report_data.get('nutrition_score', 'Not provided')}
-        
-        MEDICAL REPORT:
-        {report_text}
-        
-        Please analyze and provide scores (0-100) for each category:
-        
-        1. Labs & Vitals Score: Based on lab values, vital signs, and test results from the report
-        2. Symptoms Score: Based on severity ({report_data.get('symptom_severity', 5)}), trend ({report_data.get('symptom_trend', 'stable')}), and freshness
-        3. Demographics Score: Based on age ({member_data['age']}), family history risk, and regional factors
-        4. Upload Logs Score: Based on frequency ({upload_count} uploads) and recency of uploads
-        5. Diseases & Habits Score: Based on known diseases and harmful habits (smoking, drinking)
-        6. Treatment Adherence Score: Based on medication compliance ({report_data.get('meds_followed_percent', 80)}%) and preventive care
-        7. Lifestyle Score: Based on activity ({report_data.get('activity_level', 5)}), sleep ({report_data.get('sleep_hours', 7)} hours), nutrition ({report_data.get('nutrition_score', 5)})
-        
-        Respond in this exact format:
-        Labs_Vitals: [score]
-        Symptoms: [score]
-        Demographics: [score]
-        Upload_Logs: [score]
-        Diseases_Habits: [score]
-        Treatment_Adherence: [score]
-        Lifestyle: [score]
-        
-        Only provide the scores as integers between 0-100.
+        Please provide:
+        1. Most likely condition or explanation
+        2. Any regional health trends if applicable
+        3. Immediate recommendation
+        4. How this relates to previous health patterns (if previous insights available)
+
+        Keep it concise and practical. Start with "🔍" emoji.
         """
         
         response = model.generate_content(prompt)
-        scores_text = response.text.strip()
-        
-        # Parse scores
-        scores = {}
-        for line in scores_text.split('\n'):
-            if ':' in line:
-                key, value = line.split(':', 1)
-                try:
-                    scores[key.strip().lower().replace('_', '')] = int(value.strip())
-                except:
-                    continue
-        
-        # Ensure all required scores are present with defaults
-        required_scores = ['labsvitals', 'symptoms', 'demographics', 'uploadlogs', 
-                          'diseaseshabits', 'treatmentadherence', 'lifestyle']
-        
-        final_scores = {}
-        for score_type in required_scores:
-            final_scores[score_type] = scores.get(score_type, 50)  # Default to 50 if not found
-        
-        # Calculate final score
-        final_score = sum(final_scores.values()) // 7
-        final_scores['final'] = final_score
-        
-        return final_scores
-        
+        return response.text.strip(), previous_insights_context
     except Exception as e:
-        st.error(f"Error calculating health score: {str(e)}")
-        return None
+        st.error(f"Gemini AI error: {str(e)}")
+        return get_simple_symptom_analysis(symptoms_text), None
 
-def get_gemini_insight(report_text, previous_reports=None):
+def get_gemini_report_insight(report_text, member_data=None, region=None, member_id=None, report_id=None):
+    """Get medical report analysis from Gemini AI with sequential context"""
     if not GEMINI_AVAILABLE:
-        return "Gemini AI service is currently unavailable. Please check your API key configuration."
+        return "Report analysis requires AI setup. Basic report stored successfully.", None
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        if previous_reports:
-            prompt = f"""
-            Analyze this medical report and provide a **concise 3-4 line summary** combining all key insights (CURRENT FINDINGS, SEQUENTIAL ANALYSIS, and PREDICTIVE INSIGHTS). 
-            Base your summary on the following structure but compress it naturally into readable sentences:
-
-            Previous reports for comparison:
-            {previous_reports}
-
-            Current report to analyze:
-            {report_text}
-
-            The summary should cover:
-            - Most abnormal finding, primary diagnosis, urgent concern
-            - Significant changes or trends compared to previous reports
-            - Likely outcome, recovery timeline, complication risk, and recommended critical action
-
-            Provide the summary in 3-4 lines only.
+        # Get previous insights for sequential analysis
+        previous_insights_context = ""
+        if member_id:
+            previous_insights = get_previous_insights(member_id)
+            if previous_insights:
+                previous_insights_context = "\n\nPREVIOUS INSIGHTS FOR CONTEXT:\n"
+                for i, insight in enumerate(previous_insights, 1):
+                    previous_insights_context += f"{i}. {insight['insight_text']}\n"
+        
+        member_info = ""
+        if member_data:
+            member_info = f"""
+            Patient: {member_data['name']} ({member_data['age']}y)
+            Sex: {member_data.get('sex', 'Not specified')}
+            Region: {region if region else 'Not specified'}
             """
-        else:
-            prompt = f"""
-            Analyze this medical report and provide a **concise 3-4 line summary** combining all key insights (CURRENT FINDINGS, SEQUENTIAL ANALYSIS, and PREDICTIVE INSIGHTS). 
-            Base your summary on the current report; note that historical comparison is unavailable.
+        
+        prompt =f"""
+You are a medical summarization assistant. Analyze the current medical report and provide a concise summary in 2–3 sentences.
 
-            Current report to analyze:
-            {report_text}
+Context:
+- Patient information: {member_info}
+- Previous health insights (if any): {previous_insights_context}
 
-            The summary should cover:
-            - Most abnormal finding, primary diagnosis, urgent concern
-            - Note that sequential analysis is not available
-            - Likely outcome, recovery timeline, complication risk, and recommended critical action
+Medical Report:
+{report_text}
 
-            Provide the summary in 3-4 lines only.
-            """
+Instructions:
+1. Highlight the most significant current finding.
+2. Flag any abnormal values or concerning results.
+3. Give a brief, practical recommendation.
+4. If previous insights are available, compare them with the current report:
+   - Note improvements, worsening trends, or new findings.
+   - Mention consistency if values remain stable.
+5. Include age-related considerations if relevant.
 
+Format:
+Start with "🔍 Insight:" followed by the summary in clear, patient-friendly language.
+"""
         
         response = model.generate_content(prompt)
-        return response.text.strip()
+        return response.text.strip(), previous_insights_context
     except Exception as e:
-        return f"Error generating insight: {str(e)}"
+        st.error(f"Gemini AI error: {str(e)}")
+        return "🔍 Insight: Report uploaded successfully. Manual review recommended for detailed analysis.", None
 
+def get_simple_symptom_analysis(symptoms_text):
+    """Simple symptom analysis without Gemini"""
+    symptoms_lower = symptoms_text.lower()
+    
+    # Basic symptom pattern matching
+    if any(word in symptoms_lower for word in ['fever', 'headache', 'body ache']):
+        return "🔍 Looks like early signs of a viral infection. Rest well, stay hydrated, and monitor your temperature."
+    elif any(word in symptoms_lower for word in ['cough', 'cold', 'sore throat']):
+        return "🔍 Symptoms suggest respiratory infection. Consider steam inhalation and warm fluids."
+    elif any(word in symptoms_lower for word in ['vomiting', 'diarrhea', 'nausea']):
+        return "🔍 These could be signs of gastrointestinal issues. Stay hydrated and avoid spicy foods."
+    elif any(word in symptoms_lower for word in ['chest pain', 'breath', 'heart']):
+        return "🔍 **Please consult a doctor immediately** for cardiac-related symptoms."
+    elif any(word in symptoms_lower for word in ['back pain', 'joint pain']):
+        return "🔍 Musculoskeletal discomfort detected. Rest and gentle stretching may help."
+    else:
+        return "🔍 I've noted your symptoms. Consider uploading a medical report for detailed analysis or consult a healthcare provider."
+
+# Database helper functions
 def get_family_by_phone(phone_number):
     try:
         with conn.cursor() as cur:
@@ -344,112 +358,75 @@ def get_family_by_phone(phone_number):
 
 def create_family(phone_number, head_name, region=None):
     try:
+        # Ensure clean transaction state
+        conn.rollback()
+        
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO families (phone_number, head_name, region) VALUES (%s, %s, %s) RETURNING *",
                 (phone_number, head_name, region)
             )
+            result = cur.fetchone()
             conn.commit()
-            return cur.fetchone()
+            return result
     except Exception as e:
+        conn.rollback()
         st.error(f"Error creating family: {e}")
         return None
 
 def get_family_members(family_id):
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM family_members WHERE family_id = %s", (family_id,))
+            cur.execute("SELECT * FROM family_members WHERE family_id = %s ORDER BY created_at", (family_id,))
             return cur.fetchall()
     except Exception as e:
         st.error(f"Database error: {e}")
         return []
 
-def create_family_member(family_id, name, age, sex, family_history=None):
+def create_family_member(family_id, name, age, sex='Other'):
     try:
+        # Ensure we have a clean transaction state
+        conn.rollback()
+        print(family_id,name,age,sex)
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO family_members (family_id, name, age, sex, family_history) 
-                VALUES (%s, %s, %s, %s, %s) RETURNING *""",
-                (family_id, name, age, sex, family_history)
+                """INSERT INTO family_members (family_id, name, age, sex) 
+                VALUES (%s, %s, %s, %s) RETURNING *""",
+                (family_id, name, age, sex)
             )
+            result = cur.fetchone()
             conn.commit()
-            return cur.fetchone()
+            return result
     except Exception as e:
+        # Rollback on error
+        conn.rollback()
         st.error(f"Error creating family member: {e}")
         return None
-
-def add_member_habit(member_id, habit_type, habit_value, severity=None):
+    
+def save_symptoms(member_id, symptoms_text, severity=None):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO member_habits (member_id, habit_type, habit_value, severity) 
-                VALUES (%s, %s, %s, %s) RETURNING *""",
-                (member_id, habit_type, habit_value, severity)
+                """INSERT INTO symptoms (member_id, symptoms_text, severity) 
+                VALUES (%s, %s, %s) RETURNING *""",
+                (member_id, symptoms_text, severity)
             )
             conn.commit()
             return cur.fetchone()
     except Exception as e:
-        st.error(f"Error adding habit: {e}")
+        st.error(f"Error saving symptoms: {e}")
         return None
 
-def add_member_disease(member_id, disease_name, diagnosed_date=None, status='active'):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO member_diseases (member_id, disease_name, diagnosed_date, status) 
-                VALUES (%s, %s, %s, %s) RETURNING *""",
-                (member_id, disease_name, diagnosed_date, status)
-            )
-            conn.commit()
-            return cur.fetchone()
-    except Exception as e:
-        st.error(f"Error adding disease: {e}")
-        return None
-
-def get_member_habits(member_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM member_habits WHERE member_id = %s", (member_id,))
-            return cur.fetchall()
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return []
-
-def get_member_diseases(member_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM member_diseases WHERE member_id = %s", (member_id,))
-            return cur.fetchall()
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return []
-
-def get_upload_frequency(member_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as count FROM medical_reports WHERE member_id = %s", (member_id,))
-            result = cur.fetchone()
-            return result['count'] if result else 0
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return 0
-
-def save_medical_report(member_id, report_text, report_date=None, **kwargs):
+def save_medical_report(member_id, report_text, report_date=None):
     if report_date is None:
         report_date = datetime.now().date()
     
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO medical_reports (member_id, report_text, report_date, 
-                symptom_severity, symptom_trend, treatment_adherence, meds_followed_percent,
-                vaccinations_done, activity_level, sleep_hours, nutrition_score) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-                (member_id, report_text, report_date,
-                 kwargs.get('symptom_severity'), kwargs.get('symptom_trend'),
-                 kwargs.get('treatment_adherence'), kwargs.get('meds_followed_percent'),
-                 kwargs.get('vaccinations_done'), kwargs.get('activity_level'),
-                 kwargs.get('sleep_hours'), kwargs.get('nutrition_score'))
+                """INSERT INTO medical_reports (member_id, report_text, report_date) 
+                VALUES (%s, %s, %s) RETURNING *""",
+                (member_id, report_text, report_date)
             )
             conn.commit()
             return cur.fetchone()
@@ -457,568 +434,510 @@ def save_medical_report(member_id, report_text, report_date=None, **kwargs):
         st.error(f"Error saving medical report: {e}")
         return None
 
-def save_health_score(member_id, report_id, scores):
+def parse_name_age(input_text):
+    """Parse name and age from input like 'Riya, 4' or 'Dad, 60'"""
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO health_scores (member_id, report_id, labs_vitals_score,
-                symptoms_score, demographics_score, upload_logs_score, diseases_habits_score,
-                treatment_adherence_score, lifestyle_score, final_score) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-                (member_id, report_id, scores['labsvitals'], scores['symptoms'],
-                 scores['demographics'], scores['uploadlogs'], scores['diseaseshabits'],
-                 scores['treatmentadherence'], scores['lifestyle'], scores['final'])
-            )
-            conn.commit()
-            return cur.fetchone()
-    except Exception as e:
-        st.error(f"Error saving health score: {e}")
-        return None
+        if ',' in input_text:
+            parts = input_text.split(',')
+            name = parts[0].strip()
+            age_str = parts[1].strip()
+            age = int(''.join(filter(str.isdigit, age_str)))
+            return name, age
+        else:
+            # Try to find age at the end
+            words = input_text.split()
+            if words and words[-1].isdigit():
+                age = int(words[-1])
+                name = ' '.join(words[:-1])
+                return name, age
+            else:
+                # Default age if can't parse
+                return input_text.strip(), 25
+    except:
+        return input_text.strip(), 25
 
-def get_health_scores(member_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT hs.*, mr.report_date 
-                FROM health_scores hs
-                LEFT JOIN medical_reports mr ON hs.report_id = mr.id
-                WHERE hs.member_id = %s 
-                ORDER BY hs.created_at DESC""",
-                (member_id,)
-            )
-            return cur.fetchall()
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return []
+# Chat Functions
+def add_message(role, content, buttons=None):
+    """Add a message to chat history"""
+    st.session_state.chat_history.append({
+        "role": role,
+        "content": content,
+        "buttons": buttons or [],
+        "timestamp": datetime.now()
+    })
 
-def save_insight(member_id, report_id, insight_text):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO insight_history (member_id, report_id, insight_text) 
-                VALUES (%s, %s, %s) RETURNING *""",
-                (member_id, report_id, insight_text)
-            )
-            conn.commit()
-            return cur.fetchone()
-    except Exception as e:
-        st.error(f"Error saving insight: {e}")
-        return None
+def handle_welcome():
+    """Show welcome message and options"""
+    welcome_msg = """👋 Hi! I'm your private health assistant.
 
-def get_medical_reports(member_id):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT * FROM medical_reports 
-                WHERE member_id = %s 
-                ORDER BY report_date DESC""",
-                (member_id,)
-            )
-            return cur.fetchall()
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return []
+You can:
+• 🤒 Check symptoms instantly  
+• 📄 Upload reports/prescriptions
+• 📊 Track health automatically"""
 
-def get_insights(member_id):
+    add_message("assistant", welcome_msg, ["🤒 Check Symptoms", "📄 Upload Report"])
+    st.session_state.bot_state = "welcome"
+
+def handle_symptom_check():
+    """Start symptom checking flow"""
+    add_message("assistant", "Please describe your symptoms (e.g., 'fever and headache for 2 days')")
+    st.session_state.bot_state = "awaiting_symptom_input"
+    st.session_state.pending_action = "symptom"
+
+def handle_report_upload():
+    """Start report upload flow"""
+    add_message("assistant", "Please upload your medical report (PDF format)")
+    st.session_state.bot_state = "awaiting_report"
+    st.session_state.pending_action = "report"
+
+def process_symptom_input(symptoms_text):
+    """Process symptom input and show analysis"""
+    add_message("user", symptoms_text)
+    
+    # Get analysis with sequential context
+    region = st.session_state.current_family.get('region') if st.session_state.current_family else None
+    
+    # Check if we have a member context for sequential analysis
+    member_id = None
+    if st.session_state.current_profiles and len(st.session_state.current_profiles) == 1:
+        member_id = st.session_state.current_profiles[0]['id']
+    
+    analysis, previous_context = get_gemini_symptom_analysis(
+        symptoms_text, 
+        region=region,
+        member_id=member_id
+    )
+    
+    # Add contextual information
+    if previous_context and "PREVIOUS INSIGHTS" in previous_context:
+        analysis += "\n\n📊 *Analysis includes historical context from previous reports*"
+    
+    add_message("assistant", analysis, ["✅ Add to Timeline", "📄 Upload Report"])
+    
+    st.session_state.temp_symptoms = symptoms_text
+    st.session_state.bot_state = "welcome"
+
+def handle_add_to_timeline():
+    """Handle adding symptoms to timeline - ask who it's for"""
+    if st.session_state.current_profiles:
+        # Show existing profiles
+        profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
+        profile_buttons.append("Someone else")
+        
+        add_message("assistant", "Who is this for?", profile_buttons)
+        st.session_state.bot_state = "awaiting_profile_selection"
+    else:
+        # No profiles yet
+        add_message("assistant", "Who is this for?", ["🙋 Myself", "👶 Child", "👨 Parent", "Someone else"])
+        st.session_state.bot_state = "awaiting_profile_selection"
+
+def handle_profile_selection(selection):
+    """Handle profile selection for symptoms"""
+    add_message("user", selection)
+    
+    if selection == "Someone else" or not any(selection.startswith(p['name']) for p in st.session_state.current_profiles):
+        # Need to create new profile
+        if selection in ["🙋 Myself", "👶 Child", "👨 Parent"]:
+            add_message("assistant", "Please share their name and age (e.g., 'Aarav, 4' or 'Dad, 60')")
+        else:
+            add_message("assistant", "Please share their name and age or date of birth (e.g., 'Aarav, 4' or 'Dad, 60')")
+        
+        st.session_state.bot_state = "awaiting_name_age"
+    else:
+        # Existing profile selected
+        selected_profile = None
+        for profile in st.session_state.current_profiles:
+            if selection.startswith(profile['name']):
+                selected_profile = profile
+                break
+        
+        if selected_profile and st.session_state.temp_symptoms:
+            # Save symptoms to this profile
+            save_symptoms(selected_profile['id'], st.session_state.temp_symptoms)
+            
+            response = f"✅ Created timeline for {selected_profile['name']} ({selected_profile['age']}y)\n\n"
+            
+            # Add insight based on age and previous insights
+            previous_insights = get_previous_insights(selected_profile['id'], limit=1)
+            if previous_insights:
+                response += f"💡 Sequential Analysis: This adds to {len(previous_insights)} previous health record(s) for better pattern tracking."
+            else:
+                response += f"💡 Insight: Starting health timeline for {selected_profile['name']}."
+            
+            add_message("assistant", response, ["🤒 Check More Symptoms", "📄 Upload Report"])
+            
+            st.session_state.temp_symptoms = ""
+            st.session_state.bot_state = "welcome"
+
+def parse_name_age_sex(input_text):
+    """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya, 4, F'"""
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT ih.*, mr.report_date 
-                FROM insight_history ih
-                LEFT JOIN medical_reports mr ON ih.report_id = mr.id
-                WHERE ih.member_id = %s 
-                ORDER BY ih.created_at DESC""",
-                (member_id,)
-            )
-            return cur.fetchall()
-    except Exception as e:
-        st.error(f"Database error: {e}")
-        return []
+        parts = [part.strip() for part in input_text.split(',')]
+        name = parts[0]
+        age = 25  # default age
+        
+        # Find age in the parts
+        for part in parts[1:]:
+            if part.isdigit():
+                age = int(part)
+                break
+            elif any(char.isdigit() for char in part):
+                # Extract digits from string like "26 years"
+                age_str = ''.join(filter(str.isdigit, part))
+                if age_str:
+                    age = int(age_str)
+                break
+        
+        # Find gender (M/F/Male/Female)
+        sex = 'Other'  # default
+        for part in parts:
+            part_lower = part.lower()
+            if part_lower in ['m', 'male', 'boy', 'man']:
+                sex = 'Male'
+                break
+            elif part_lower in ['f', 'female', 'girl', 'woman']:
+                sex = 'Female'
+                break
+        print(name,age,sex)
+        return name, age, sex
+    except:
+        # Fallback if parsing fails
+        return input_text.strip(), 25, 'Other'
+
+def handle_name_age_input(name_age_text):
+    """Handle name and age input to create new profile"""
+    add_message("user", name_age_text)
+    
+    # Parse name, age, and gender if provided
+    name, age, sex = parse_name_age_sex(name_age_text)
+    
+    if st.session_state.current_family:
+        # Create new family member
+        new_member = create_family_member(st.session_state.current_family['id'], name, age, sex)
+        print(new_member)
+        if new_member:
+            st.session_state.current_profiles.append(new_member)
+            
+            # Save symptoms if we have them
+            if st.session_state.temp_symptoms:
+                save_symptoms(new_member['id'], st.session_state.temp_symptoms)
+                
+                response = f"✅ Created timeline for {name} ({age}y, {sex})\n\n"
+                response += f"💡 Insight: Starting health monitoring for {name}. Future analyses will build on this baseline."
+                
+                add_message("assistant", response, ["🤒 Check More Symptoms", "📄 Upload Report"])
+                st.session_state.temp_symptoms = ""
+            else:
+                # If it's for report upload
+                if st.session_state.pending_action == "report" and st.session_state.temp_report_text:
+                    finalize_report_processing(new_member)
+                else:
+                    add_message("assistant", f"✅ Created profile for {name} ({age}y, {sex})", ["🤒 Check Symptoms", "📄 Upload Report"])
+            
+            st.session_state.bot_state = "welcome"
+        else:
+            add_message("assistant", "Sorry, couldn't create the profile. Please try again.", ["🤒 Check Symptoms"])
+            st.session_state.bot_state = "welcome"
+
+def process_uploaded_report(uploaded_file):
+    """Process uploaded report and handle profile selection"""
+    add_message("user", f"Uploaded: {uploaded_file.name}")
+    
+    # Extract text from PDF
+    with st.spinner("Processing report..."):
+        report_text = extract_text_from_pdf(uploaded_file)
+    
+    if not report_text:
+        add_message("assistant", "❌ Could not read the PDF file. Please try another file.", 
+                   ["📄 Upload Report", "🤒 Check Symptoms"])
+        st.session_state.bot_state = "welcome"
+        return
+    
+    st.session_state.temp_report_text = report_text
+    
+    # Ask which profile this is for
+    if st.session_state.current_profiles:
+        profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
+        profile_buttons.append("Someone else")
+        
+        add_message("assistant", "Report received. Is this for one of your profiles?", profile_buttons)
+        st.session_state.bot_state = "awaiting_profile_selection"
+        st.session_state.pending_action = "report"
+    else:
+        add_message("assistant", "Report received. Who is this for? Please share name and age (e.g., 'Dad, 65')")
+        st.session_state.bot_state = "awaiting_name_age"
+        st.session_state.pending_action = "report"
+
+def finalize_report_processing(profile):
+    """Finalize report processing for a specific profile"""
+    if st.session_state.temp_report_text:
+        # Save report to database
+        report = save_medical_report(profile['id'], st.session_state.temp_report_text)
+        
+        if report:
+            # Get Gemini AI insight for the report with sequential context
+            region = st.session_state.current_family.get('region') if st.session_state.current_family else None
+            
+            with st.spinner("Analyzing report with AI..."):
+                insight, previous_context = get_gemini_report_insight(
+                    st.session_state.temp_report_text, 
+                    profile, 
+                    region,
+                    profile['id'],
+                    report['id']
+                )
+            
+            # Save the insight to the database
+            if insight and "🔍 Insight:" in insight:
+                save_insight(profile['id'], report['id'], insight)
+            
+            response = f"✅ Linked to {profile['name']}'s timeline.\n\n{insight}"
+            
+            # Add sequential analysis context
+            if previous_context and "PREVIOUS INSIGHTS" in previous_context:
+                response += f"\n\n📊 *Sequential analysis applied: This insight builds upon previous health records*"
+            
+            # If there were symptoms mentioned, add context
+            if st.session_state.temp_symptoms:
+                response += f"\n\nWhat symptoms was this for?"
+                buttons = ["🤒 Check More Symptoms", "📄 Upload Another Report"]
+            else:
+                buttons = ["🤒 Check Symptoms", "📄 Upload Another Report"]
+            
+            add_message("assistant", response, buttons)
+        else:
+            add_message("assistant", f"❌ Failed to save report for {profile['name']}. Please try again.", 
+                       ["📄 Upload Report"])
+        
+        st.session_state.temp_report_text = ""
+        st.session_state.temp_symptoms = ""
+        st.session_state.bot_state = "welcome"
 
 # UI Components
-def render_sidebar():
-    with st.sidebar:
-        st.title("🏥 Health AI Agent")
-        
-        if st.session_state.current_family:
-            st.success(f"Logged in as: {st.session_state.current_family['head_name']}")
-            st.write(f"Phone: {st.session_state.current_family['phone_number']}")
-            
-            if st.button("Logout"):
-                st.session_state.current_family = None
-                st.session_state.current_member = None
-                st.session_state.chat_history = []
-                st.session_state.registration_step = 0
-                st.session_state.file_processed = False
-                st.session_state.show_health_form = False
-                st.rerun()
-            
-            # Family members management
-            st.subheader("Family Members")
-            members = get_family_members(st.session_state.current_family['id'])
-            
-            for member in members:
-                # Get latest health score
-                scores = get_health_scores(member['id'])
-                latest_score = scores[0]['final_score'] if scores else "N/A"
-                
-                if st.button(
-                    f"{member['name']} ({member['age']}, {member['sex']}) - Score: {latest_score}", 
-                    key=f"member_{member['id']}",
-                    use_container_width=True
-                ):
-                    st.session_state.current_member = member
-                    st.session_state.chat_history = []
-                    st.session_state.file_processed = False
-                    st.session_state.show_health_form = False
-                    st.rerun()
-            
-            if st.button("+ Add New Member"):
-                st.session_state.registration_step = 2
-                st.session_state.new_member_data = {
-                    "name": "", "age": "", "sex": "", "family_history": "",
-                    "habits": [], "diseases": []
-                }
-                
-        else:
-            st.info("Please enter your phone number to get started")
-
-def render_health_form():
-    # Deprecated UI - no longer used. Kept as a stub for compatibility.
-    st.info("Report analysis now runs automatically after upload. No additional form is required.")
-
-def render_health_score_history():
-    if st.session_state.current_member:
-        st.subheader("Health Score History")
-        
-        scores = get_health_scores(st.session_state.current_member['id'])
-        
-        if scores:
-            # Display latest score prominently
-            latest = scores[0]
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Overall Score", f"{latest['final_score']}/100")
-            with col2:
-                st.metric("Labs & Vitals", f"{latest['labs_vitals_score']}/100")
-            with col3:
-                st.metric("Lifestyle", f"{latest['lifestyle_score']}/100")
-            with col4:
-                st.metric("Treatment", f"{latest['treatment_adherence_score']}/100")
-            
-            # Score history
-            if len(scores) > 1:
-                st.subheader("Score Trend")
-                score_data = []
-                for score in reversed(scores):
-                    score_data.append({
-                        'Date': score['created_at'].strftime('%Y-%m-%d'),
-                        'Overall': score['final_score'],
-                    })
-            
-                import pandas as pd
-                df = pd.DataFrame(score_data)
-                st.line_chart(df.set_index('Date')['Overall'])
-            
-            # Detailed score breakdown
-            with st.expander("Detailed Score Breakdown"):
-                for i, score in enumerate(scores[:5]):  # Show last 5 scores
-                    st.write(f"**Report from {score['report_date'] if score['report_date'] else score['created_at'].date()}**")
-                    
-                    cols = st.columns(4)
-                    with cols[0]:
-                        st.write(f"Labs & Vitals: {score['labs_vitals_score']}")
-                        st.write(f"Symptoms: {score['symptoms_score']}")
-                    with cols[1]:
-                        st.write(f"Demographics: {score['demographics_score']}")
-                        st.write(f"Upload Logs: {score['upload_logs_score']}")
-                    with cols[2]:
-                        st.write(f"Diseases & Habits: {score['diseases_habits_score']}")
-                        st.write(f"Treatment: {score['treatment_adherence_score']}")
-                    with cols[3]:
-                        st.write(f"Lifestyle: {score['lifestyle_score']}")
-                        st.write(f"**Final: {score['final_score']}/100**")
-                    
-                    if i < len(scores) - 1:
-                        st.divider()
-        else:
-            st.info("No health scores yet. Upload a medical report to generate your first health score.")
-
-def render_member_profile():
-    if st.session_state.current_member:
-        member = st.session_state.current_member
-        
-        with st.expander("Member Profile", expanded=False):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write(f"**Name:** {member['name']}")
-                st.write(f"**Age:** {member['age']}")
-                st.write(f"**Sex:** {member['sex']}")
-                st.write(f"**Family History:** {member.get('family_history', 'Not provided')}")
-            
-            with col2:
-                # Display habits
-                habits = get_member_habits(member['id'])
-                if habits:
-                    st.write("**Habits:**")
-                    for habit in habits:
-                        severity_text = f" ({habit['severity']})" if habit['severity'] else ""
-                        st.write(f"- {habit['habit_type']}: {habit['habit_value']}{severity_text}")
-                else:
-                    st.write("**Habits:** None recorded")
-                
-                # Display diseases
-                diseases = get_member_diseases(member['id'])
-                if diseases:
-                    st.write("**Medical Conditions:**")
-                    for disease in diseases:
-                        date_text = f" (diagnosed: {disease['diagnosed_date']})" if disease['diagnosed_date'] else ""
-                        st.write(f"- {disease['disease_name']}{date_text}")
-                else:
-                    st.write("**Medical Conditions:** None recorded")
-
 def render_chat_interface():
-    st.header("Health Analysis Chat")
-    
-    # Member profile
-    render_member_profile()
+    """Render the main chat interface"""
+    # Header with family info
+    if st.session_state.current_family:
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.header("💬 Health Assistant")
+        with col2:
+            if st.session_state.current_profiles:
+                st.write(f"👥 {len(st.session_state.current_profiles)} profiles")
+        with col3:
+            if st.button("🔄 Reset Chat"):
+                st.session_state.chat_history = []
+                handle_welcome()
+                st.rerun()
+    else:
+        st.header("💬 Health Assistant")
     
     # Chat container
-    chat_container = st.container(height=400)
+    chat_container = st.container(height=500)
     
     with chat_container:
-        for message in st.session_state.chat_history:
+        for i, message in enumerate(st.session_state.chat_history):
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+                
+                # Display buttons for the latest assistant message
+                if (message["role"] == "assistant" and 
+                    message.get("buttons") and 
+                    i == len(st.session_state.chat_history) - 1):
+                    
+                    cols = st.columns(len(message["buttons"]))
+                    for col_idx, button_text in enumerate(message["buttons"]):
+                        with cols[col_idx]:
+                            if st.button(button_text, key=f"chat_btn_{i}_{col_idx}"):
+                                handle_chat_button(button_text)
+                                st.rerun()
+    
+    # File uploader (conditionally displayed)
+    if st.session_state.bot_state == "awaiting_report":
+        st.divider()
+        uploaded_file = st.file_uploader("Upload medical report (PDF)", 
+                                        type=["pdf"], 
+                                        key="report_uploader")
+        if uploaded_file:
+            process_uploaded_report(uploaded_file)
+            st.rerun()
     
     # User input
-    if prompt := st.chat_input("Type your message here...", key="chat_input"):
-        # Prevent processing if already processing
-        if st.session_state.processing:
-            st.warning("Please wait, processing your previous request...")
-            return
-            
-        # Add user message to chat history
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        st.session_state.processing = True
-        
-        # Process the message
-        process_user_message(prompt)
-        
-        # Reset processing flag
-        st.session_state.processing = False
+    user_input = st.chat_input("Type your message here...")
+    
+    if user_input:
+        handle_user_input(user_input)
         st.rerun()
 
-def process_user_message(message):
-    # If no family is registered
-    if not st.session_state.current_family:
-        # Prompt to add a member directly
-        st.session_state.chat_history.append({
-            "role": "assistant", 
-            "content": "Please add a member first with name, age, and sex to begin."
-        })
-        st.session_state.registration_step = 2
-        return
-    
-    # If family is registered but no member is selected
-    if not st.session_state.current_member:
-        # Check if the message is a member name
-        members = get_family_members(st.session_state.current_family['id'])
-        member_names = [m['name'].lower() for m in members]
-        
-        if message.lower() in member_names:
-            # Select the member
-            for member in members:
-                if member['name'].lower() == message.lower():
-                    st.session_state.current_member = member
-                    # Get latest health score
-                    scores = get_health_scores(member['id'])
-                    score_text = f" (Current Health Score: {scores[0]['final_score']}/100)" if scores else ""
-                    st.session_state.chat_history.append({
-                        "role": "assistant", 
-                        "content": f"Now analyzing reports for {member['name']}{score_text}. You can upload a medical report PDF for comprehensive health analysis."
-                    })
+def reset_db_connection():
+    """Reset the database connection"""
+    global conn
+    try:
+        if conn is not None:
+            conn.close()
+        conn = init_connection()
+        init_db()
+        return True
+    except Exception as e:
+        st.error(f"Failed to reset database connection: {e}")
+        return False
+
+def handle_chat_button(button_text):
+    """Handle button clicks in chat"""
+    if button_text == "🤒 Check Symptoms":
+        handle_symptom_check()
+    elif button_text == "📄 Upload Report" or button_text == "📄 Upload Another Report":
+        handle_report_upload()
+    elif button_text == "🤒 Check More Symptoms":
+        handle_symptom_check()
+    elif button_text == "✅ Add to Timeline":
+        handle_add_to_timeline()
+    elif button_text.startswith(("🙋", "👶", "👨")) or "Someone else" in button_text:
+        handle_profile_selection(button_text)
+    elif any(button_text.startswith(p['name']) for p in st.session_state.current_profiles):
+        # Existing profile selected
+        if st.session_state.pending_action == "symptom":
+            handle_profile_selection(button_text)
+        elif st.session_state.pending_action == "report":
+            # Find the selected profile and finalize report processing
+            for profile in st.session_state.current_profiles:
+                if button_text.startswith(profile['name']):
+                    add_message("user", button_text)
+                    finalize_report_processing(profile)
                     break
-        elif "add" in message.lower() and "member" in message.lower():
-            st.session_state.registration_step = 2
-            st.session_state.chat_history.append({
-                "role": "assistant", 
-                "content": "Let's add a new member. Please provide name, age, and sex."
-    })
-        else:
-            # Ask to select or create a member
-            member_list = ", ".join([m['name'] for m in members])
-            st.session_state.chat_history.append({
-                "role": "assistant", 
-                "content": f"I found these family members: {member_list}. Please type a name to select or say 'add new member' to create a new one."
-            })
-        return
+
+def handle_user_input(user_input):
+    """Handle user text input based on current state"""
+    if st.session_state.bot_state == "awaiting_symptom_input":
+        process_symptom_input(user_input)
     
-    # If we have both family and member, process medical report uploads
-    if "upload" in message.lower() or "report" in message.lower():
-        st.session_state.chat_history.append({
-            "role": "assistant", 
-            "content": "Please upload a medical report PDF using the file uploader below. After upload, I'll ask for additional health information to calculate your comprehensive health score."
-        })
-    elif "score" in message.lower() and "history" in message.lower():
-        scores = get_health_scores(st.session_state.current_member['id'])
-        if scores:
-            latest = scores[0]
-            st.session_state.chat_history.append({
-                "role": "assistant", 
-                "content": f"Your latest health score is {latest['final_score']}/100. Check the Health Score History section below for detailed breakdown and trends."
-            })
-        else:
-            st.session_state.chat_history.append({
-                "role": "assistant", 
-                "content": "You don't have any health scores yet. Upload a medical report to get your first comprehensive health analysis."
-            })
-
-def render_file_uploader():
-    if st.session_state.current_member:
-        st.subheader("Upload Medical Report")
-        
-        # Prevent concurrent processing
-        if st.session_state.upload_processing:
-            st.info("Processing your upload... please wait.")
-            return
-
-        uploaded_file = st.file_uploader(
-            "Choose a PDF file",
-            type="pdf",
-            key=f"report_uploader_{st.session_state.current_member['id']}_{st.session_state.uploader_version}"
-        )
-        
-        if uploaded_file is not None and not st.session_state.file_processed:
-            st.session_state.file_processed = True
-            st.session_state.upload_processing = True
-            with st.spinner("Extracting text and analyzing report..."):
-                # Extract text from PDF
-                report_text = extract_text_from_pdf(uploaded_file)
-                
-                if report_text:
-                    st.session_state.current_report_text = report_text
-                    # Save report with minimal data (no additional form)
-                    report = save_medical_report(
-                        st.session_state.current_member['id'],
-                        st.session_state.current_report_text
-                    )
-                    if report:
-                        if GEMINI_AVAILABLE:
-                            # Calculate health score directly
-                            health_scores = get_health_score_from_gemini(
-                                st.session_state.current_report_text,
-                                st.session_state.current_member,
-                                {}
-                            )
-                            if health_scores:
-                                save_health_score(st.session_state.current_member['id'], report['id'], health_scores)
-                                # Prepare previous reports for insight
-                                previous_reports = get_medical_reports(st.session_state.current_member['id'])
-                                if len(previous_reports) > 1:
-                                    previous_texts = [r['report_text'] for r in previous_reports[1:]]
-                                else:
-                                    previous_texts = None
-                                insight = get_gemini_insight(st.session_state.current_report_text, previous_texts)
-                                save_insight(st.session_state.current_member['id'], report['id'], insight)
-                                # Inform user
-                                st.session_state.chat_history.append({
-                        "role": "assistant", 
-                                    "content": f"""**Health Score Analysis Complete!**
-                                
-**Overall Health Score: {health_scores['final']}/100**
-
-**Category Breakdown:**
-- 🧪 Labs & Vitals: {health_scores['labsvitals']}/100
-- 🤒 Symptoms: {health_scores['symptoms']}/100  
-- 👥 Demographics: {health_scores['demographics']}/100
-- 📊 Upload Frequency: {health_scores['uploadlogs']}/100
-- 🏥 Diseases & Habits: {health_scores['diseaseshabits']}/100
-- 💊 Treatment Adherence: {health_scores['treatmentadherence']}/100
-- 🏃‍♀️ Lifestyle: {health_scores['lifestyle']}/100
-
-**Medical Insight:**
-{insight}"""
-                                })
-                            else:
-                                st.error("Failed to calculate health score. Please try again.")
-                        else:
-                            st.warning("Gemini AI is not configured. Report saved, but no analysis was performed.")
-                    else:
-                        st.error("Failed to save medical report. Please try again.")
-                    # Reset uploader (bump key) and processing flags to avoid re-processing
-                    st.session_state.uploader_version += 1
-                    st.session_state.current_report_text = ""
-                    st.session_state.file_processed = False
-                    st.session_state.upload_processing = False
-                    # Force a single rerun so the cleared uploader and chat update render immediately
-                    st.rerun()
-                else:
-                    st.error("Could not extract text from the PDF. Please try another file.")
-                    st.session_state.file_processed = False
-                    st.session_state.upload_processing = False
-
-def render_insight_history():
-    if st.session_state.current_member:
-        st.subheader("Medical Insights History")
-        
-        insights = get_insights(st.session_state.current_member['id'])
-        
-        if insights:
-            for insight in insights:
-                with st.expander(f"Insight from {insight['report_date'] if insight['report_date'] else insight['created_at'].date()}"):
-                    st.write(insight['insight_text'])
-        else:
-            st.info("No insights yet. Upload a medical report to generate insights.")
-
-def render_registration_form():
-    # Direct member registration with minimal info
-    if st.session_state.registration_step == 2:
-        with st.form("member_registration", clear_on_submit=True):
-            st.subheader("Add Family Member")
-            
-            # Basic info only - removed habits and medical conditions
-            col1, col2 = st.columns(2)
-            with col1:
-                name = st.text_input("Name*", value=st.session_state.new_member_data['name'])
-                age = st.number_input("Age*", min_value=0, max_value=120, 
-                                    value=int(st.session_state.new_member_data['age']) 
-                                    if st.session_state.new_member_data['age'] else 0)
-                sex = st.selectbox("Sex*", options=["", "Male", "Female", "Other"])
-            
-            with col2:
-                family_history = st.text_area("Family History (Optional)", 
-                    placeholder="e.g., Diabetes, Heart Disease, Cancer", 
-                    value=st.session_state.new_member_data['family_history'])
-            
-            st.info("💡 You can add habits, conditions, and other details later by editing the profile.")
-            
-            if st.form_submit_button("Add Member"):
-                if name and age and sex:
-                    # Ensure a family exists (auto-create minimal family silently)
-                    if not st.session_state.current_family:
-                        auto_phone = f"AUTO-{uuid.uuid4()}"
-                        family = create_family(auto_phone, name, None)
-                        if family:
-                            st.session_state.current_family = family
-                        else:
-                            st.error("Failed to initialize backend profile. Please try again.")
-                            return
-                    # Create member with basic info only
-                    member = create_family_member(
-                        st.session_state.current_family['id'], 
-                        name, age, sex, family_history
-                    )
-                    
-                    if member:
-                        # No habits or diseases added during onboarding
-                        
-                        st.session_state.current_member = member
-                        st.session_state.registration_step = 0
-                        st.session_state.new_member_data = {
-                            "name": "", "age": "", "sex": "", "family_history": "",
-                            "habits": [], "diseases": []
-                        }
-                        st.session_state.chat_history.append({
-                            "role": "assistant", 
-                            "content": f"Added {name} to your family! You can now upload medical reports for comprehensive health score analysis. You can add more health details later by editing the profile."
-                        })
-                        st.rerun()
-                    else:
-                        st.error("Failed to add family member. Please try again.")
-                else:
-                    st.error("Please fill in all required fields (marked with *)")
-# Main app logic
-def main():
-    # Show API key warning if not available
-    if not GEMINI_AVAILABLE:
-        st.warning("⚠️ Gemini API key is not properly configured. Health score calculation and insights will not work correctly.")
+    elif st.session_state.bot_state == "awaiting_name_age":
+        handle_name_age_input(user_input)
     
-    # Initial phone number input if not logged in
-    if not st.session_state.current_family:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.title("🏥 Health AI Agent")
-            st.write("Enter your phone number to get started with comprehensive health analysis")
+    elif st.session_state.bot_state == "awaiting_profile_selection":
+        # Handle text input for profile selection
+        add_message("user", user_input)
+        add_message("assistant", "Please use the buttons above to select a profile or choose 'Someone else'")
+    
+    else:
+        # General conversation
+        add_message("user", user_input)
+        
+        # Check if input contains symptoms directly
+        symptom_keywords = ['fever', 'headache', 'pain', 'cough', 'cold', 'vomiting', 'tired', 'sick', 'hurt']
+        if any(keyword in user_input.lower() for keyword in symptom_keywords):
+            # Direct symptom input
+            region = st.session_state.current_family.get('region') if st.session_state.current_family else None
             
-            with st.form("phone_input", clear_on_submit=True):
+            # Check for member context for sequential analysis
+            member_id = None
+            if st.session_state.current_profiles and len(st.session_state.current_profiles) == 1:
+                member_id = st.session_state.current_profiles[0]['id']
+            
+            analysis, previous_context = get_gemini_symptom_analysis(user_input, region=region, member_id=member_id)
+            
+            if previous_context and "PREVIOUS INSIGHTS" in previous_context:
+                analysis += "\n\n📊 *Analysis includes historical context from previous reports*"
+            
+            add_message("assistant", analysis, ["✅ Add to Timeline", "📄 Upload Report"])
+            st.session_state.temp_symptoms = user_input
+        
+        elif any(word in user_input.lower() for word in ['hello', 'hi', 'hey']):
+            add_message("assistant", "Hello! How can I help with your health concerns today?",
+                       ["🤒 Check Symptoms", "📄 Upload Report"])
+        
+        elif any(word in user_input.lower() for word in ['report', 'upload', 'pdf', 'medical']):
+            handle_report_upload()
+        
+        else:
+            add_message("assistant", "I can help you analyze symptoms or medical reports. What would you like to do?",
+                       ["🤒 Check Symptoms", "📄 Upload Report"])
+
+def render_phone_or_create_profile():
+    """Render login/create profile interface"""
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("🏥 Health AI Agent")
+        st.write("Enter your phone number to get started")
+        
+        # Check if we're in create family mode
+        if "create_family_mode" not in st.session_state:
+            st.session_state.create_family_mode = False
+        
+        if not st.session_state.create_family_mode:
+            # Phone number input form
+            with st.form("phone_input", clear_on_submit=False):
                 phone_number = st.text_input("Phone Number", placeholder="Enter your phone number")
                 if st.form_submit_button("Continue"):
                     if phone_number:
-                        # Check if family exists
                         family = get_family_by_phone(phone_number)
                         if family:
                             st.session_state.current_family = family
-                            st.session_state.chat_history.append({
-                                "role": "assistant", 
-                                "content": f"Welcome back {family['head_name']}! Please select a family member to analyze reports and view health scores."
-                            })
+                            # Load existing profiles
+                            profiles = get_family_members(family['id'])
+                            st.session_state.current_profiles = profiles
+                            
+                            handle_welcome()
                             st.rerun()
                         else:
-                            # Prompt to create a profile for this phone number
+                            # Set create family mode and store phone
+                            st.session_state.create_family_mode = True
                             st.session_state.pending_phone = phone_number
-                            st.session_state.show_create_family = True
-                            st.info("No profile found for this phone. Create a profile below.")
+                            st.rerun()
                     else:
                         st.error("Please enter a phone number")
-            
-            # Inline create-profile flow when phone not found
-            if st.session_state.show_create_family and st.session_state.pending_phone:
-                with st.form("create_family_inline", clear_on_submit=True):
-                    st.subheader("Create Profile")
-                    head_name = st.text_input("Head of Family Name", placeholder="Enter the head of family name")
-                    region = st.text_input("Region/City (optional)", placeholder="Enter your city/region (optional)")
-                    if st.form_submit_button("Create Profile"):
-                        if head_name:
-                            family = create_family(st.session_state.pending_phone, head_name, region)
-                            if family:
-                                st.session_state.current_family = family
-                                st.session_state.show_create_family = False
-                                st.session_state.pending_phone = ""
-                                # Move directly to adding a member
-                                st.session_state.registration_step = 2
-                                st.session_state.chat_history.append({
-                                    "role": "assistant",
-                                    "content": f"Welcome {head_name}! Profile created. Please add your first family member."
-                                })
-                                st.rerun()
-                            else:
-                                st.error("Failed to create profile. Please try again.")
-                        else:
-                            st.error("Please enter the head of family name.")
-    
-    # Render sidebar
-    render_sidebar()
-    
-    # Render main content based on state
-    if st.session_state.current_family:
-        if st.session_state.registration_step > 0:
-            render_registration_form()
+        
         else:
-            # Main interface with tabs
-            if st.session_state.current_member:
-                tab1, tab2, tab3 = st.tabs(["💬 Chat & Upload", "📊 Health Scores", "📋 Medical Insights"])
+            # Create family form (separate from phone input)
+            st.info("New phone number! Let's create your profile.")
+            
+            with st.form("create_family", clear_on_submit=False):
+                head_name = st.text_input("Your Name", placeholder="Enter your name")
+                region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
                 
-                with tab1:
-                    render_chat_interface()
-                    if st.session_state.show_health_form:
-                        render_health_form()
+                col_create, col_back = st.columns(2)
+                with col_create:
+                    create_clicked = st.form_submit_button("Create Profile")
+                with col_back:
+                    back_clicked = st.form_submit_button("← Back")
+                
+                if create_clicked:
+                    if head_name:
+                        family = create_family(st.session_state.pending_phone, head_name, region)
+                        if family:
+                            st.session_state.current_family = family
+                            st.session_state.current_profiles = []
+                            st.session_state.create_family_mode = False
+                            
+                            handle_welcome()
+                            st.rerun()
+                        else:
+                            st.error("Failed to create profile. Please try again.")
                     else:
-                        render_file_uploader()
+                        st.error("Please enter your name.")
                 
-                with tab2:
-                    render_health_score_history()
-                
-                with tab3:
-                    render_insight_history()
-            else:
-                render_chat_interface()
+                if back_clicked:
+                    st.session_state.create_family_mode = False
+                    st.rerun()
+
+def main():
+    """Main application function"""
+    # Initialize welcome message if chat is empty
+    if not st.session_state.chat_history and st.session_state.current_family:
+        handle_welcome()
+    
+    # Show appropriate interface
+    if not st.session_state.current_family:
+        render_phone_or_create_profile()
     else:
-        # Show registration form if in registration process
-        if st.session_state.registration_step > 0:
-            render_registration_form()
+        render_chat_interface()
+        
+        # Show profiles in sidebar
+        if st.session_state.current_profiles:
+            with st.sidebar:
+                st.subheader("👥 Family Profiles")
+                for profile in st.session_state.current_profiles:
+                    st.write(f"• {profile['name']} ({profile['age']}y)")
 
 if __name__ == "__main__":
     main()
