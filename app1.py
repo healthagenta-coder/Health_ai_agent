@@ -55,6 +55,34 @@ hide_streamlit_style = """
     header {visibility: hidden;}
     </style>
 """
+js_code = """
+<script>
+    // This function hides the target nested element
+    function hideStreamlitElements() {
+        const mainBlockContainer = window.parent.document.querySelector('[data-testid="stMainBlockContainer"]');
+        if (mainBlockContainer) {
+            const verticalBlocks = mainBlockContainer.querySelectorAll('[data-testid="stVerticalBlock"]');
+            if (verticalBlocks.length > 1) {
+                const targetVerticalBlock = verticalBlocks[1]; // Adjust index if needed
+                const elementContainers = targetVerticalBlock.querySelectorAll('[data-testid="stElementContainer"]');
+                if (elementContainers.length > 0) {
+                    const targetElementContainer = elementContainers[0]; // Adjust index if needed
+                    targetElementContainer.style.display = 'none';
+                }
+            }
+        }
+    }
+
+    // Run the function when the page loads
+    window.addEventListener('load', hideStreamlitElements);
+
+    // Also run it on a delay in case elements are loaded later
+    setTimeout(hideStreamlitElements, 500); 
+</script>
+"""
+
+# Embed the JavaScript
+html(js_code, height=0)
 html('''
 <script>
     window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
@@ -987,6 +1015,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
