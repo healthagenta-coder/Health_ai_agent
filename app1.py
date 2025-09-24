@@ -260,22 +260,20 @@ def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None,
                     previous_insights_context += f"{i}. {insight['insight_text']}\n"
         
         prompt = f"""
-        Analyze these symptoms and provide a brief, helpful analysis (2-3 sentences max):
-        
-        Symptoms: {symptoms_text}
-        Patient Age: {member_age if member_age else 'Not specified'}
-        Patient Sex: {member_sex if member_sex else 'Not specified'}
-        Region: {region if region else 'Not specified'}
-        {previous_insights_context}
-        
-        Please provide:
-        1. Most likely condition or explanation
-        2. Any regional health trends if applicable
-        3. Immediate recommendation
-        4. How this relates to previous health patterns (if previous insights available)
+🔍 Analyze these symptoms and provide a **single-line, practical medical insight**. 
+Do **not** give generic recommendations like 'consult a doctor'; focus on likely conditions, explanations, and actionable insights.
 
-        Keep it concise and practical. Start with "🔍" emoji.
-        """
+Symptoms: {symptoms_text}
+Patient Age: {member_age if member_age else 'Not specified'}
+Patient Sex: {member_sex if member_sex else 'Not specified'}
+Region: {region if region else 'Not specified'}
+{previous_insights_context}
+
+Provide in **1 line only**, covering:
+1. Most likely condition or explanation
+2. Immediate practical steps or lifestyle adjustments
+3. Relation to previous health patterns if available
+"""
         
         response = model.generate_content(prompt)
         return response.text.strip(), previous_insights_context
@@ -952,6 +950,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
