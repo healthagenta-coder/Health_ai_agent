@@ -18,27 +18,9 @@ st.set_page_config(
 )
 hide_streamlit_style = """
 <style>
-window.addEventListener('load', function() {
-    // Hide header, footer, menu
-    const header = document.querySelector('header');
-    if(header) header.style.display = 'none';
-
-    const footer = document.querySelector('footer');
-    if(footer) footer.style.display = 'none';
-
-    const menu = document.querySelector('#MainMenu');
-    if(menu) menu.style.visibility = 'hidden';
-
-    // Hide Streamlit link
-    document.querySelectorAll('a[href*="streamlit.io"]').forEach(el => el.style.display = 'none');
-
-    // Hide profile container and viewer badge (dynamic)
-    const profile = document.querySelector('._profilePreview_gzau3_63');
-    if(profile) profile.style.display = 'none';
-
-    const badge = document.querySelector('._viewerBadge_nim44_23');
-    if(badge) badge.style.display = 'none';
-});
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -968,6 +950,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
