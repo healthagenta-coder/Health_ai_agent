@@ -15,12 +15,15 @@ st.set_page_config(
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': None,  # Removes "Get Help" menu
-        'Report a bug': None,  # Removes "Report a bug" menu
-        'About': None  # Removes "About" menu (which contains GitHub link)
-    }
 )
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
@@ -949,6 +952,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
