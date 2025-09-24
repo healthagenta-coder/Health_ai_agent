@@ -33,6 +33,10 @@ hide_streamlit_style = """
     div[data-testid="stMainContent"] {
         padding-bottom: 0rem;
     }
+    div[data-testid="stElementContainer"] {
+        display: none;
+    }
+    
 
     /* Hide the hosted banner with "Hosted with Streamlit" on Streamlit Cloud */
     /* This uses JavaScript injected via st.markdown */
@@ -988,6 +992,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
