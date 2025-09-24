@@ -244,8 +244,8 @@ def save_insight(member_id, report_id, insight_text):
 
 def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None, region=None, member_id=None):
     """Get symptom analysis from Gemini AI with sequential context"""
-    if not GEMINI_AVAILABLE:
-        return get_simple_symptom_analysis(symptoms_text), None
+    # if not GEMINI_AVAILABLE:
+    #     return get_simple_symptom_analysis(symptoms_text), None
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -952,6 +952,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
