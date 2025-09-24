@@ -18,32 +18,20 @@ st.set_page_config(
 )
 hide_streamlit_style = """
 <style>
+/* Hide the hamburger menu, footer, and header */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 
+/* Hide "Made with Streamlit" links */
 a[href*="streamlit.io"] {
     display: none !important;
 }
 
-/* Remove the profile container */
-div[class*="_profileContainer_gzau3_53"]{
+/* Hide profile badges */
+div[data-testid="stToolbar"] {
     display: none !important;
 }
-
-/* Alternative selectors for the same elements */
-._container_gzau3_1{
-    display: none !important;
-}
-
-. _viewerBadge_nim44_23{
- display: none !important;
-}
-
-._profileContainer_gzau3_53{
-    display: none !important;
-}
-
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
 </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -973,6 +961,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
