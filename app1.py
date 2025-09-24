@@ -16,14 +16,19 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-hide_streamlit_style = """
+st.markdown("""
 <style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
+/* Target the badge container */
+a[href="https://streamlit.io/cloud"] {
+    display: none !important;
+}
+
+/* Extra safety: target by class */
+._container_gzau3_1._viewerBadge_nim44_23 {
+    display: none !important;
+}
 </style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
@@ -950,6 +955,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
