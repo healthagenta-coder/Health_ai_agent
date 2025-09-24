@@ -18,6 +18,25 @@ st.set_page_config(
 )
 hide_streamlit_style = """
 <style>
+
+a[href*="streamlit.io"] {
+    display: none !important;
+}
+
+/* Remove the profile container */
+div[class*="profileContainer"] {
+    display: none !important;
+}
+
+/* Alternative selectors for the same elements */
+._container_grau3_1_viewerBadge_nim44_23 {
+    display: none !important;
+}
+
+._profileContainer_grau3_53 {
+    display: none !important;
+}
+
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
@@ -950,6 +969,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
