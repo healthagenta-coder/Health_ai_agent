@@ -14,7 +14,12 @@ st.set_page_config(
     page_title="Health AI Agent",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': None,  # Removes "Get Help" menu
+        'Report a bug': None,  # Removes "Report a bug" menu
+        'About': None  # Removes "About" menu (which contains GitHub link)
+    }
 )
 
 # Initialize Gemini - Check if API key is valid
@@ -944,6 +949,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
