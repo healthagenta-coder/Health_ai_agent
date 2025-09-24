@@ -55,12 +55,12 @@ hide_streamlit_style = """
     header {visibility: hidden;}
     </style>
 """
-html('''
-<script>
-    window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
-        .forEach(e => e.setAttribute("style", "opacity:0;cursor:none;"));
-</script>
-''')
+# html('''
+# <script>
+#     window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
+#         .forEach(e => e.setAttribute("style", "opacity:0;cursor:none;"));
+# </script>
+# ''')
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
@@ -987,6 +987,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
