@@ -16,36 +16,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-footer="""<style>
-a:link , a:visited{
-color: blue;
-background-color: transparent;
-text-decoration: underline;
-}
-
-a:hover,  a:active {
-color: red;
-background-color: transparent;
-text-decoration: underline;
-}
-
-.footer {
-height:60px;
-z-index:999;
-position: fixed;
-left: 0;
-bottom: 0;
-width: 100%;
-background-color: #0E1117;
-color: black;
-text-align: center;
-}
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 </style>
-<div class="footer">
-
-</div>
 """
-st.markdown(footer,unsafe_allow_html=True)
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
