@@ -16,25 +16,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-hide_streamlit_style = """
-<style>
-/* Hide the hamburger menu, footer, and header */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-
-/* Hide "Made with Streamlit" links */
-a[href*="streamlit.io"] {
-    display: none !important;
+footer="""<style>
+a:link , a:visited{
+color: blue;
+background-color: transparent;
+text-decoration: underline;
 }
 
-/* Hide profile badges */
-div[data-testid="stToolbar"] {
-    display: none !important;
+a:hover,  a:active {
+color: red;
+background-color: transparent;
+text-decoration: underline;
+}
+
+.footer {
+height:60px;
+z-index:999;
+position: fixed;
+left: 0;
+bottom: 0;
+width: 100%;
+background-color: #0E1117;
+color: black;
+text-align: center;
 }
 </style>
+<div class="footer">
+
+</div>
 """
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+st.markdown(footer,unsafe_allow_html=True)
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
@@ -961,6 +972,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
