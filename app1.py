@@ -33,7 +33,7 @@ window.addEventListener('load', function() {
     document.querySelectorAll('a[href*="streamlit.io"]').forEach(el => el.style.display = 'none');
 
     // Hide profile container and viewer badge (dynamic)
-    const profile = document.querySelector('._profileContainer_gzau3_53');
+    const profile = document.querySelector('._profilePreview_gzau3_63');
     if(profile) profile.style.display = 'none';
 
     const badge = document.querySelector('._viewerBadge_nim44_23');
@@ -968,6 +968,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
