@@ -18,71 +18,12 @@ st.set_page_config(
 )
 hide_streamlit_style = """
     <style>
-    /* Hide the Streamlit main menu */
-    #MainMenu {
-        visibility: hidden;
-    }
-
-    /* Hide the default footer with "Made with Streamlit" */
-    footer {
-        visibility: hidden;
-    }
-
-    /* Target the main content block and adjust its height */
-    /* This prevents the scrollbar caused by the missing footer */
-    div[data-testid="stMainContent"] {
-        padding-bottom: 0rem;
-    }
-
-    /* Hide the hosted banner with "Hosted with Streamlit" on Streamlit Cloud */
-    /* This uses JavaScript injected via st.markdown */
-    /* Note: This is an advanced technique and may not work consistently due to iframe security. */
-    div[data-testid="stDecoration"] {
-        display: none;
-    }
-
-    /* Hide the Streamlit toolbar (top right hamburger menu and other buttons) */
-    div[data-testid="stToolbar"] {
-        display: none;
-    }
-    
-    /* Hide the Streamlit status widget (e.g., "Running..." indicator) */
-    div[data-testid="stStatusWidget"] {
-        visibility: hidden;
-    }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     </style>
 """
-js_code = """
-<script>
-    // This function hides the target nested element
-    function hideStreamlitElements() {
-        const mainBlockContainer = window.parent.document.querySelector('[data-testid="stMainBlockContainer"]');
-        if (mainBlockContainer) {
-            const verticalBlocks = mainBlockContainer.querySelectorAll('[data-testid="stVerticalBlock"]');
-            if (verticalBlocks.length > 1) {
-                const targetVerticalBlock = verticalBlocks[1]; // Adjust index if needed
-                const elementContainers = targetVerticalBlock.querySelectorAll('[data-testid="stElementContainer"]');
-                if (elementContainers.length > 0) {
-                    const targetElementContainer = elementContainers[0]; // Adjust index if needed
-                    targetElementContainer.style.display = 'none';
-                }
-            }
-        }
-    }
-
-    // Run the function when the page loads
-    window.addEventListener('load', hideStreamlitElements);
-
-    // Also run it on a delay in case elements are loaded later
-    setTimeout(hideStreamlitElements, 500); 
-</script>
-"""
-
-# Embed the JavaScript
-html(js_code, height=0)
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 html('''
 <script>
     window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
