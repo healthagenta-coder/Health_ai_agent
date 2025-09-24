@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import json
 import uuid
 import re
-
+from streamlit.components.v1 import html
 # Page configuration
 st.set_page_config(
     page_title="Health AI Agent",
@@ -16,13 +16,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-st.markdown("""
-<style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-</style>
-""", unsafe_allow_html=True)
+
+
+html('''
+<script>
+    window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
+        .forEach(e => e.setAttribute("style", "display: none;"));
+</script>
+''')
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
@@ -949,6 +950,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
