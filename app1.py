@@ -27,7 +27,7 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 html('''
 <script>
     window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
-        .forEach(e => e.setAttribute("style", "opacity:0;cursor:none;"));
+        .forEach(e => e.setAttribute("style", "display:none;"));
 </script>
 ''')
 
@@ -956,6 +956,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
