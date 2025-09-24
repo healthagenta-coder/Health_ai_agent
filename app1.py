@@ -18,6 +18,10 @@ st.set_page_config(
 )
 hide_streamlit_style = """
 <style>
+._container_gzau3_1{
+    padding: 6rem;
+    display: none !important;
+}
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
@@ -950,6 +954,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
