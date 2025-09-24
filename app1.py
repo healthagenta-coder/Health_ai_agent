@@ -24,16 +24,20 @@ a[href*="streamlit.io"] {
 }
 
 /* Remove the profile container */
-div[class*="profileContainer"] {
+div[class*="_profileContainer_gzau3_53"]{
     display: none !important;
 }
 
 /* Alternative selectors for the same elements */
-._container_gzau3_1 _viewerBadge_nim44_23 {
+._container_gzau3_1{
     display: none !important;
 }
 
-._profilePreview_gzau3_53 {
+. _viewerBadge_nim44_23{
+ display: none !important;
+}
+
+._profileContainer_gzau3_53{
     display: none !important;
 }
 
@@ -969,6 +973,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
