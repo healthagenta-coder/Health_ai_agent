@@ -16,37 +16,45 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-hide_and_resize_script = """
-<style>
+hide_streamlit_style = """
+    <style>
+    /* Hide the Streamlit main menu */
+    #MainMenu {
+        visibility: hidden;
+    }
+
+    /* Hide the default footer with "Made with Streamlit" */
+    footer {
+        visibility: hidden;
+    }
+
+    /* Target the main content block and adjust its height */
+    /* This prevents the scrollbar caused by the missing footer */
+    div[data-testid="stMainContent"] {
+        padding-bottom: 0rem;
+    }
+
+    /* Hide the hosted banner with "Hosted with Streamlit" on Streamlit Cloud */
+    /* This uses JavaScript injected via st.markdown */
+    /* Note: This is an advanced technique and may not work consistently due to iframe security. */
+    div[data-testid="stDecoration"] {
+        display: none;
+    }
+
+    /* Hide the Streamlit toolbar (top right hamburger menu and other buttons) */
+    div[data-testid="stToolbar"] {
+        display: none;
+    }
+    
+    /* Hide the Streamlit status widget (e.g., "Running..." indicator) */
+    div[data-testid="stStatusWidget"] {
+        visibility: hidden;
+    }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    /* Hide the scrollbar but keep functionality */
-    .main::-webkit-scrollbar {
-        width: 0;
-    }
-    .main {
-        scrollbar-width: none;
-    }
-</style>
-<script>
-    function adjustIframeHeight() {
-        const iframe = window.frameElement;
-        if (iframe) {
-            iframe.style.height = document.documentElement.scrollHeight + 'px';
-        }
-    }
-    window.addEventListener('load', adjustIframeHeight);
-    window.addEventListener('resize', adjustIframeHeight);
-</script>
+    header {visibility: hidden;}
+    </style>
 """
-hide_streamlit_style = """
-<style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-</style>
-"""
-html(hide_and_resize_script)
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 html('''
 <script>
@@ -980,6 +988,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
