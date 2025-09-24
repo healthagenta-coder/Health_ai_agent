@@ -16,21 +16,37 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+hide_and_resize_script = """
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    /* Hide the scrollbar but keep functionality */
+    .main::-webkit-scrollbar {
+        width: 0;
+    }
+    .main {
+        scrollbar-width: none;
+    }
+</style>
+<script>
+    function adjustIframeHeight() {
+        const iframe = window.frameElement;
+        if (iframe) {
+            iframe.style.height = document.documentElement.scrollHeight + 'px';
+        }
+    }
+    window.addEventListener('load', adjustIframeHeight);
+    window.addEventListener('resize', adjustIframeHeight);
+</script>
+"""
 hide_streamlit_style = """
 <style>
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
-    /* This hides the scrollbar in most browsers (Chrome, Safari, Edge, etc.) */
-.main::-webkit-scrollbar {
-        width: 0;
-    }
-    /* This hides the scrollbar in Firefox */
-.main {
-        scrollbar-width: none;
-    }
 </style>
 """
+html(hide_and_resize_script)
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 html('''
 <script>
@@ -964,6 +980,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
