@@ -18,15 +18,9 @@ st.set_page_config(
 )
 st.markdown("""
 <style>
-/* Target the badge container */
-a[href="https://streamlit.io/cloud"] {
-    display: none !important;
-}
-
-/* Extra safety: target by class */
-._container_gzau3_1._viewerBadge_nim44_23 {
-    display: none !important;
-}
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -955,6 +949,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
