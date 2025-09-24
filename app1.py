@@ -21,6 +21,14 @@ hide_streamlit_style = """
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+    /* This hides the scrollbar in most browsers (Chrome, Safari, Edge, etc.) */
+.main::-webkit-scrollbar {
+        width: 0;
+    }
+    /* This hides the scrollbar in Firefox */
+.main {
+        scrollbar-width: none;
+    }
 </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -956,6 +964,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
