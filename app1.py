@@ -28,6 +28,8 @@ html('''
 <script>
     window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
         .forEach(e => e.setAttribute("style", "display:none;"));
+    window.top.document.querySelectorAll(`[href*="share.streamlit.io"]`)
+        .forEach(e => e.setAttribute("style","display:none;"));
 </script>
 ''')
 
@@ -956,6 +958,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
