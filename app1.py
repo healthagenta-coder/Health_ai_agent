@@ -24,15 +24,6 @@ hide_streamlit_style = """
     </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-html('''
-<script>
-    window.top.document.querySelectorAll(`[href*="streamlit.io"]`)
-        .forEach(e => e.setAttribute("style", "display:none;"));
-    window.top.document.querySelectorAll(`[href*="share.streamlit.io"]`)
-        .forEach(e => e.setAttribute("style","display:none;"));
-</script>
-''')
-
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAZJHtWCI9LBqYVz3FMBfuJqsmo7-U8MN4"
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 20:  # Basic validation
@@ -958,6 +949,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
