@@ -36,6 +36,7 @@ else:
     GEMINI_AVAILABLE = False
 
 # Database connection
+# Database connection
 @st.cache_resource
 def init_connection():
     try:
@@ -45,7 +46,7 @@ def init_connection():
     user="neondb_owner",
     password="npg_5GXIK6DrVLHU",
     cursor_factory=RealDictCursor
-)
+        )
         return conn
     except Exception as e:
         st.error(f"Database connection failed: {e}")
@@ -949,36 +950,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
