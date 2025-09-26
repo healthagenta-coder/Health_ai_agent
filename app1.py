@@ -18,7 +18,6 @@ st.set_page_config(
 )
 hide_streamlit_style = """
     <style>
-    #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     </style>
@@ -982,3 +981,4 @@ def main():
                     st.markdown(card_html, unsafe_allow_html=True)
 if __name__ == "__main__":
     main()
+
