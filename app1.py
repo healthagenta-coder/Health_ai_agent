@@ -41,7 +41,7 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-    host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+     host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
     database="Health_med",
     user="neondb_owner",
     password="npg_5GXIK6DrVLHU",
@@ -945,8 +945,40 @@ def main():
         if st.session_state.current_profiles:
             with st.sidebar:
                 st.subheader("👥 Family Profiles")
-                for profile in st.session_state.current_profiles:
-                    st.write(f"• {profile['name']} ({profile['age']}y)")
 
+                # Different colors for different family members
+                colors = ["#e6f3ff", "#fff0e6", "#e6ffe6", "#f0e6ff", "#fffae6"]
+
+                for i, profile in enumerate(st.session_state.current_profiles):
+                    color = colors[i % len(colors)]
+                    
+                    card_html = f"""
+<div style="background-color: {color}; padding: 5px; border-radius: 10px; margin: 10px 0; border-left: 4px solid #4CAF50;">
+    <div style="display: flex; align-items: center; justify-content: space-between;">
+        <div>
+            <h4 style="margin: 0; color: #333;">{profile['name']}</h4>
+            <p style="margin: 0; color: #666;">Age: {profile['age']} years | Gender: {profile['sex']}</p>
+        </div>
+        <span style="font-size: 17px;">
+            {'👶' if profile['age'] < 2 else 
+             '👧' if profile['sex'].lower() == 'female' and profile['age'] < 5 else 
+             '👦' if profile['sex'].lower() == 'male' and profile['age'] < 5 else 
+             '👧' if profile['sex'].lower() == 'female' and profile['age'] < 12 else 
+             '👦' if profile['sex'].lower() == 'male' and profile['age'] < 12 else 
+             '👩' if profile['sex'].lower() == 'female' and profile['age'] < 20 else 
+             '👨' if profile['sex'].lower() == 'male' and profile['age'] < 20 else 
+             '👩‍💼' if profile['sex'].lower() == 'female' and profile['age'] < 40 else 
+             '👨‍💼' if profile['sex'].lower() == 'male' and profile['age'] < 40 else 
+             '👩‍🔧' if profile['sex'].lower() == 'female' and profile['age'] < 60 else 
+             '👨‍🔧' if profile['sex'].lower() == 'male' and profile['age'] < 60 else 
+             '👩‍🦳' if profile['sex'].lower() == 'female' and profile['age'] < 75 else 
+             '👨‍🦳' if profile['sex'].lower() == 'male' and profile['age'] < 75 else 
+             '👵' if profile['sex'].lower() == 'female' else 
+             '👴'}
+        </span>
+    </div>
+</div>
+"""
+                    st.markdown(card_html, unsafe_allow_html=True)
 if __name__ == "__main__":
     main()
