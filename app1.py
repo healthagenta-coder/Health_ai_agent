@@ -1347,18 +1347,18 @@ def render_chat_interface():
         handle_user_input(user_input)
         st.rerun()
 
-def reset_db_connection():
-    """Reset the database connection"""
-    global conn
-    try:
-        if conn is not None:
-            conn.close()
-        conn = init_connection()
-        init_db()
-        return True
-    except Exception as e:
-        st.error(f"Failed to reset database connection: {e}")
-        return False
+# def reset_db_connection():
+#     """Reset the database connection"""
+#     global conn
+#     try:
+#         if conn is not None:
+#             conn.close()
+#         conn = init_connection()
+#         init_db()
+#         return True
+#     except Exception as e:
+#         st.error(f"Failed to reset database connection: {e}")
+#         return False
 
 def handle_chat_button(button_text):
     """Handle button clicks in chat"""
@@ -1737,4 +1737,5 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
