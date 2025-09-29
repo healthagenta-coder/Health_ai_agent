@@ -62,127 +62,127 @@ def init_connection():
 conn = init_connection()
 
 # Initialize database tables
-def init_db():
-    if conn is not None:
-        try:
-            with conn.cursor() as cur:
-                # Rollback any existing transaction first
-                conn.rollback()
+# def init_db():
+#     if conn is not None:
+#         try:
+#             with conn.cursor() as cur:
+#                 # Rollback any existing transaction first
+#                 conn.rollback()
                 
-                # Create families table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS families (
-                        id SERIAL PRIMARY KEY,
-                        phone_number VARCHAR(20) UNIQUE NOT NULL,
-                        head_name VARCHAR(100) NOT NULL,
-                        region VARCHAR(100),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create families table
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS families (
+#                         id SERIAL PRIMARY KEY,
+#                         phone_number VARCHAR(20) UNIQUE NOT NULL,
+#                         head_name VARCHAR(100) NOT NULL,
+#                         region VARCHAR(100),
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create family_members table with additional health fields
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS family_members (
-                        id SERIAL PRIMARY KEY,
-                        family_id INTEGER REFERENCES families(id) ON DELETE CASCADE,
-                        name VARCHAR(100) NOT NULL,
-                        age INTEGER NOT NULL,
-                        sex VARCHAR(10) NOT NULL,
-                        family_history TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create family_members table with additional health fields
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS family_members (
+#                         id SERIAL PRIMARY KEY,
+#                         family_id INTEGER REFERENCES families(id) ON DELETE CASCADE,
+#                         name VARCHAR(100) NOT NULL,
+#                         age INTEGER NOT NULL,
+#                         sex VARCHAR(10) NOT NULL,
+#                         family_history TEXT,
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create member_habits table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS member_habits (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        habit_type VARCHAR(50) NOT NULL,
-                        habit_value VARCHAR(100) NOT NULL,
-                        severity VARCHAR(20),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create member_habits table
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS member_habits (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         habit_type VARCHAR(50) NOT NULL,
+#                         habit_value VARCHAR(100) NOT NULL,
+#                         severity VARCHAR(20),
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create member_diseases table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS member_diseases (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        disease_name VARCHAR(100) NOT NULL,
-                        diagnosed_date DATE,
-                        status VARCHAR(20) DEFAULT 'active',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create member_diseases table
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS member_diseases (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         disease_name VARCHAR(100) NOT NULL,
+#                         diagnosed_date DATE,
+#                         status VARCHAR(20) DEFAULT 'active',
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create medical_reports table with additional fields
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS medical_reports (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        report_text TEXT,
-                        report_date DATE,
-                        symptom_severity INTEGER,
-                        symptom_trend VARCHAR(20),
-                        treatment_adherence INTEGER,
-                        meds_followed_percent INTEGER,
-                        vaccinations_done BOOLEAN DEFAULT FALSE,
-                        activity_level INTEGER,
-                        sleep_hours INTEGER,
-                        nutrition_score INTEGER,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create medical_reports table with additional fields
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS medical_reports (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         report_text TEXT,
+#                         report_date DATE,
+#                         symptom_severity INTEGER,
+#                         symptom_trend VARCHAR(20),
+#                         treatment_adherence INTEGER,
+#                         meds_followed_percent INTEGER,
+#                         vaccinations_done BOOLEAN DEFAULT FALSE,
+#                         activity_level INTEGER,
+#                         sleep_hours INTEGER,
+#                         nutrition_score INTEGER,
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create health_scores table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS health_scores (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        report_id INTEGER REFERENCES medical_reports(id) ON DELETE CASCADE,
-                        labs_vitals_score INTEGER NOT NULL,
-                        symptoms_score INTEGER NOT NULL,
-                        demographics_score INTEGER NOT NULL,
-                        upload_logs_score INTEGER NOT NULL,
-                        diseases_habits_score INTEGER NOT NULL,
-                        treatment_adherence_score INTEGER NOT NULL,
-                        lifestyle_score INTEGER NOT NULL,
-                        final_score INTEGER NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create health_scores table
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS health_scores (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         report_id INTEGER REFERENCES medical_reports(id) ON DELETE CASCADE,
+#                         labs_vitals_score INTEGER NOT NULL,
+#                         symptoms_score INTEGER NOT NULL,
+#                         demographics_score INTEGER NOT NULL,
+#                         upload_logs_score INTEGER NOT NULL,
+#                         diseases_habits_score INTEGER NOT NULL,
+#                         treatment_adherence_score INTEGER NOT NULL,
+#                         lifestyle_score INTEGER NOT NULL,
+#                         final_score INTEGER NOT NULL,
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create insight_history table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS insight_history (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        report_id INTEGER REFERENCES medical_reports(id) ON DELETE CASCADE,
-                        insight_text TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create insight_history table
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS insight_history (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         report_id INTEGER REFERENCES medical_reports(id) ON DELETE CASCADE,
+#                         insight_text TEXT NOT NULL,
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                # Create symptoms table for symptom tracking
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS symptoms (
-                        id SERIAL PRIMARY KEY,
-                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
-                        symptoms_text TEXT NOT NULL,
-                        severity INTEGER,
-                        reported_date DATE DEFAULT CURRENT_DATE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+#                 # Create symptoms table for symptom tracking
+#                 cur.execute("""
+#                     CREATE TABLE IF NOT EXISTS symptoms (
+#                         id SERIAL PRIMARY KEY,
+#                         member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+#                         symptoms_text TEXT NOT NULL,
+#                         severity INTEGER,
+#                         reported_date DATE DEFAULT CURRENT_DATE,
+#                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#                     )
+#                 """)
                 
-                conn.commit()
-        except Exception as e:
-            # Rollback on error and show detailed error
-            conn.rollback()
-            st.error(f"Database initialization failed: {e}")
-init_db()
+#                 conn.commit()
+#         except Exception as e:
+#             # Rollback on error and show detailed error
+#             conn.rollback()
+#             st.error(f"Database initialization failed: {e}")
+# init_db()
 
 # Session state initialization
 def init_session_state():
@@ -1347,18 +1347,18 @@ def render_chat_interface():
         handle_user_input(user_input)
         st.rerun()
 
-def reset_db_connection():
-    """Reset the database connection"""
-    global conn
-    try:
-        if conn is not None:
-            conn.close()
-        conn = init_connection()
-        init_db()
-        return True
-    except Exception as e:
-        st.error(f"Failed to reset database connection: {e}")
-        return False
+# def reset_db_connection():
+#     """Reset the database connection"""
+#     global conn
+#     try:
+#         if conn is not None:
+#             conn.close()
+#         conn = init_connection()
+#         init_db()
+#         return True
+#     except Exception as e:
+#         st.error(f"Failed to reset database connection: {e}")
+#         return False
 
 def handle_chat_button(button_text):
     """Handle button clicks in chat"""
@@ -1737,6 +1737,7 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
 
 
