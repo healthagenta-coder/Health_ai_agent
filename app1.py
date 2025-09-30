@@ -891,27 +891,27 @@ def save_medical_report(member_id, report_text, report_date=None):
         st.error(f"Error saving medical report: {e}")
         return None
 
-# def parse_name_age(input_text):
-    """Parse name and age from input like 'Riya, 4' or 'Dad, 60'"""
-    try:
-        if ',' in input_text:
-            parts = input_text.split(',')
-            name = parts[0].strip()
-            age_str = parts[1].strip()
-            age = int(''.join(filter(str.isdigit, age_str)))
-            return name, age
-        else:
-            # Try to find age at the end
-            words = input_text.split()
-            if words and words[-1].isdigit():
-                age = int(words[-1])
-                name = ' '.join(words[:-1])
-                return name, age
-            else:
-                # Default age if can't parse
-                return input_text.strip(), 25
-    except:
-        return input_text.strip(), 25
+# # def parse_name_age(input_text):
+#     """Parse name and age from input like 'Riya, 4' or 'Dad, 60'"""
+#     try:
+#         if ',' in input_text:
+#             parts = input_text.split(',')
+#             name = parts[0].strip()
+#             age_str = parts[1].strip()
+#             age = int(''.join(filter(str.isdigit, age_str)))
+#             return name, age
+#         else:
+#             # Try to find age at the end
+#             words = input_text.split()
+#             if words and words[-1].isdigit():
+#                 age = int(words[-1])
+#                 name = ' '.join(words[:-1])
+#                 return name, age
+#             else:
+#                 # Default age if can't parse
+#                 return input_text.strip(), 25
+#     except:
+#         return input_text.strip(), 25
 
 # Chat Functions
 def add_message(role, content, buttons=None):
@@ -2240,4 +2240,5 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
