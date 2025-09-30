@@ -1306,7 +1306,7 @@ def handle_profile_selection(selection):
         if selected_profile:
             process_health_input_for_profile(selected_profile)
 def parse_name_age_sex(input_text):
-    """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya 4 Female'"""
+    """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya 4.5 Female'"""
     try:
         # Split by commas or spaces
         parts = re.split(r'[,\s]+', input_text.strip())
@@ -1314,18 +1314,14 @@ def parse_name_age_sex(input_text):
 
         name = parts[0] if parts else "Unknown"
         age = 25  # default age
-        
-        # Find age in the parts
-        for part in parts[1:]:
-            if part.isdigit():
-                age = int(part)
-                break
-            elif any(char.isdigit() for char in part):
-                age_str = ''.join(filter(str.isdigit, part))
-                if age_str:
-                    age = int(age_str)
-                break
-        
+
+        # Find age using regex (integer or float)
+        match = re.search(r'\d+(\.\d+)?', input_text)
+        if match:
+            age = float(match.group())
+            if age.is_integer():  # convert 2.0 → 2
+                age = int(age)
+
         # Find gender (M/F/Male/Female)
         sex = 'Other'  # default
         for part in parts[1:]:
@@ -1336,10 +1332,10 @@ def parse_name_age_sex(input_text):
             elif part_lower in ['f', 'female', 'girl', 'woman']:
                 sex = 'Female'
                 break
-        
+
         print(name, age, sex)
         return name, age, sex
-    except Exception as e:
+    except Exception:
         return input_text.strip(), 25, 'Other'
 
 def handle_name_age_input(name_age_text):
@@ -2244,3 +2240,4 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
