@@ -18,14 +18,6 @@ st.set_page_config(
 )
 
 
-hide_streamlit_style = """
-<style>
-header {visibility: hidden;}
-</style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-
-
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAucG55i7_H5wJsvHV2cQh5utyqIbLHSVo"
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 20:  # Basic validation
@@ -2234,6 +2226,7 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
 
 
