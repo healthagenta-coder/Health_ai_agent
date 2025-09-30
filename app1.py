@@ -188,22 +188,34 @@ init_db()
 def init_session_state():
     defaults = {
         "current_family": None,
-        "current_profiles": [],  # List of family members
+        "current_profiles": [], 
         "chat_history": [],
-        "bot_state": "welcome",  # welcome, awaiting_symptom_input, awaiting_profile_selection, awaiting_report, awaiting_name_age
+        "bot_state": "welcome",
         "temp_symptoms": "",
         "temp_report": None,
         "temp_report_text": "",
         "awaiting_profile_choice": False,
-        "pending_action": None,  # "symptom", "report"
+        "pending_action": None,
         "temp_name_age": "",
         "create_family_mode": False,
-        "pending_phone": ""
+        "pending_phone": "",
+        "awaiting_input_type": False,
+        "awaiting_profile_creation": False,
+        "awaiting_more_input": False,
+        "temp_insight": "",
+        "sequential_analysis_count": 0,
+        "new_user_primary_insight": "",
+        "new_user_input_type": "",
+        "new_user_input_data": "",
+        "awaiting_post_insight_profile": False,
+        # ADD THIS NEW STATE
+        "temp_report_for_both": None,  # Store report temporarily for "Both" flow
     }
     
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
 
 init_session_state()
 
@@ -911,25 +923,250 @@ def add_message(role, content, buttons=None):
         "timestamp": datetime.now()
     })
 
+def handle_input_type_selection(input_type):
+    """Handle the selection of input type (Symptom/Report/Both)"""
+    add_message("user", input_type)
+    
+    # Store the input type
+    st.session_state.pending_input_type = input_type
+    st.session_state.new_user_input_type = input_type
+    
+    # FOR NEW USERS: Process input first, then create profile
+    if not st.session_state.current_profiles:
+        if input_type == "🤒 Check Symptoms":
+            add_message("assistant", "Please describe the symptoms (e.g., 'fever and headache for 2 days')")
+            st.session_state.bot_state = "awaiting_symptom_input_new_user"
+            
+        elif input_type == "📄 Upload Report":
+            add_message("assistant", "Please upload the medical report (PDF format)")
+            st.session_state.bot_state = "awaiting_report_new_user"
+            
+        elif input_type == "Both":
+            # CHANGED: Ask for report first, then symptoms
+            add_message("assistant", "Let's start with the medical report. Please upload it (PDF format)")
+            st.session_state.bot_state = "awaiting_report_new_user"
+            st.session_state.pending_both = True  # Flag to handle both inputs
+    
+    else:
+        # RETURNING USERS: Choose profile first (existing flow)
+        profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
+        profile_buttons.extend(["👶 Add Child", "💑 Add Spouse", "👥 Add Other"])
+        
+        add_message("assistant", 
+                   "Who is this health information for?",
+                   profile_buttons)
+        st.session_state.bot_state = "awaiting_profile_selection"
+
+def process_new_user_symptom_input(symptoms_text):
+    """Process symptoms for new users (before profile creation)"""
+    add_message("user", symptoms_text)
+    
+    # Store the symptoms for later profile creation
+    st.session_state.new_user_input_data = symptoms_text
+    
+    # Generate primary insight without member context
+    with st.spinner("Analyzing symptoms..."):
+        analysis, _ = get_gemini_symptom_analysis(
+            symptoms_text, 
+            member_age=None,
+            member_sex=None,
+            region=None,
+            member_id=None
+        )
+    
+    # Store the primary insight
+    st.session_state.new_user_primary_insight = analysis
+    st.session_state.sequential_analysis_count = 1
+    
+    # Check if this is part of "Both" input
+    if getattr(st.session_state, 'pending_both', False):
+        st.session_state.pending_both = False
+        # For "Both", automatically proceed to report upload after profile creation
+        response = f"## 🔍 Primary Insight\n\n"
+        response += f"{analysis}\n\n"
+        response += "Now, let's create a profile. Who are these symptoms for?"
+    else:
+        response = f"## 🔍 Primary Insight\n\n"
+        response += f"{analysis}\n\n"
+        response += "Now, let's create a profile to save this information. Who are these symptoms for?"
+    
+    buttons = ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]
+    
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_post_insight_profile"
+def handle_new_user_report_symptoms(symptoms_text):
+    """Handle symptoms for new user report and generate insight"""
+    add_message("user", symptoms_text)
+    
+    report_text = st.session_state.temp_report_text_storage
+    labs_data = getattr(st.session_state, 'temp_labs_data', {"labs": []})
+    
+    # Process symptoms
+    symptoms_lower = symptoms_text.lower()
+    if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
+        symptoms_to_store = "No symptoms reported - routine checkup"
+    else:
+        symptoms_to_store = symptoms_text
+    
+    # Store combined data
+    st.session_state.new_user_input_data = {
+        "report_text": report_text,
+        "symptoms_text": symptoms_to_store,
+        "labs_data": labs_data
+    }
+    
+    # Generate primary insight without member context
+    region = st.session_state.current_family.get('region') if st.session_state.current_family else None
+    
+    with st.spinner("Generating insight..."):
+        insight = get_gemini_report_insight(
+            report_text, 
+            symptoms_to_store, 
+            None,  # No member data
+            region,
+            None,  # No member ID
+            None   # No report ID
+        )
+    
+    # Store the primary insight
+    st.session_state.new_user_primary_insight = insight
+    st.session_state.sequential_analysis_count = 1
+    
+    # Show primary insight and prompt for profile creation
+    response = f"## 🔍 Primary Insight\n\n"
+    response += f"{insight}\n\n"
+    response += "Now, let's create a profile to save this information. Who is this report for?"
+    
+    buttons = ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]
+    
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_post_insight_profile"
+    
+    # Clean up
+    st.session_state.temp_report_text_storage = None
+    st.session_state.temp_labs_data = None
+
+def process_new_user_report(uploaded_file):
+    """Process report for new users (before profile creation)"""
+    add_message("user", f"Uploaded: {uploaded_file.name}")
+    
+    # Extract text from PDF
+    with st.spinner("Processing report..."):
+        report_text = extract_text_from_pdf(uploaded_file)
+    
+    if not report_text:
+        add_message("assistant", "❌ Could not read the PDF file. Please try another file.", 
+                   ["📄 Upload Report", "🤒 Check Symptoms"])
+        st.session_state.bot_state = "welcome"
+        return
+    
+    # Store the report for later profile creation
+    st.session_state.new_user_input_data = report_text
+    
+    # Get lab data if available
+    labs_data = {"labs": []}
+    if report_text and GEMINI_AVAILABLE:
+        labs_data, _ = get_health_score_from_gemini(report_text, {})
+    
+    # Check if this is part of "Both" input
+    if getattr(st.session_state, 'pending_both', False):
+        # For "Both", store the report and immediately ask for symptoms
+        st.session_state.temp_report_for_both = report_text
+        st.session_state.temp_labs_data = labs_data
+        
+        add_message("assistant", 
+                   "✅ Report uploaded successfully!\n\n"
+                   "Now, please describe the symptoms (e.g., 'fever and headache for 2 days')")
+        st.session_state.bot_state = "awaiting_symptoms_for_both_report"
+    else:
+        # Single report upload - ask about symptoms for correlation
+        add_message("assistant", 
+                   "📋 To provide better analysis, were there any specific symptoms or health concerns?\n\n"
+                   "💡 Examples: 'fever for 3 days', 'chest pain during exercise', or type 'none' for routine checkup")
+        
+        st.session_state.bot_state = "awaiting_report_symptoms_new_user"
+        st.session_state.temp_report_text_storage = report_text
+        st.session_state.temp_labs_data = labs_data
+
+def handle_symptoms_for_both_report(symptoms_text):
+    """Handle symptoms input when user selected 'Both' (report already uploaded)"""
+    add_message("user", symptoms_text)
+    
+    report_text = st.session_state.temp_report_for_both
+    labs_data = getattr(st.session_state, 'temp_labs_data', {"labs": []})
+    
+    # Process symptoms
+    symptoms_lower = symptoms_text.lower()
+    if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
+        symptoms_to_store = "No symptoms reported - routine checkup"
+    else:
+        symptoms_to_store = symptoms_text
+    
+    # Store combined data for both report and symptoms
+    st.session_state.new_user_input_data = {
+        "report_text": report_text,
+        "symptoms_text": symptoms_to_store,
+        "labs_data": labs_data
+    }
+    
+    # Generate primary insight without member context
+    region = st.session_state.current_family.get('region') if st.session_state.current_family else None
+    
+    with st.spinner("Generating comprehensive insight..."):
+        insight = get_gemini_report_insight(
+            report_text, 
+            symptoms_to_store, 
+            None,  # No member data
+            region,
+            None,  # No member ID
+            None   # No report ID
+        )
+    
+    # Store the primary insight
+    st.session_state.new_user_primary_insight = insight
+    st.session_state.sequential_analysis_count = 1
+    
+    # Show primary insight and prompt for profile creation
+    response = f"## 🔍 Comprehensive Primary Insight\n\n"
+    response += f"**Based on both report and symptoms:**\n\n"
+    response += f"{insight}\n\n"
+    response += "Now, let's create a profile to save this information. Who is this for?"
+    
+    buttons = ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]
+    
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_post_insight_profile"
+    
+    # Clean up temporary states
+    st.session_state.temp_report_for_both = None
+    st.session_state.temp_labs_data = None
+    st.session_state.pending_both = False
+
 def handle_welcome():
-    """Show welcome message and options"""
-    welcome_msg = """
+    """Show welcome message and input type selection"""
+    if st.session_state.current_profiles:
+        # Returning user with existing profiles
+        welcome_msg = f"""
+# 👋 Welcome back!
+
+I see you have {len(st.session_state.current_profiles)} profile(s) in your family.
+
+### What would you like to do today?
+"""
+        buttons = ["🤒 Check Symptoms", "📄 Upload Report", "Both"]
+    else:
+        # First-time user
+        welcome_msg = """
 # 👋 Hi there! I'm your **Personal Health Assistant**
 
-I can help you stay on top of your health easily and quickly.
-🧠 Insights are AI-generated
-### What you can do:
-- 🤒 **Check Symptoms:** Get instant insights into your health.  
-- 📄 **Upload Reports/Prescriptions:** Keep all your documents in one place.  
-- 📊 **Track Health:** Monitor your health over time automatically.
+Let's get started with your health journey!
 
-Let's get started! 🚀
+### What would you like to do?
 """
-
-
-    add_message("assistant", welcome_msg, ["🤒 Check Symptoms", "📄 Upload Report"])
-    st.session_state.bot_state = "welcome"
-
+        buttons = ["🤒 Check Symptoms", "📄 Upload Report", "Both"]
+    
+    add_message("assistant", welcome_msg, buttons)
+    st.session_state.bot_state = "awaiting_input_type"
 def handle_symptom_check():
     """Start symptom checking flow"""
     add_message("assistant", "Please describe your symptoms (e.g., 'fever and headache for 2 days')")
@@ -943,38 +1180,48 @@ def handle_report_upload():
     st.session_state.pending_action = "report"
 
 def process_symptom_input(symptoms_text):
-    """Process symptom input and show analysis"""
+    """Process symptom input and generate primary insight"""
     add_message("user", symptoms_text)
     
-    # Get analysis with sequential context
+    profile = st.session_state.temp_profile
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
-    # Check if we have a member context for sequential analysis
-    member_id = None
-    if st.session_state.current_profiles and len(st.session_state.current_profiles) == 1:
-        member_id = st.session_state.current_profiles[0]['id']
+    # Generate primary insight
+    with st.spinner("Analyzing symptoms..."):
+        analysis, previous_context = get_gemini_symptom_analysis(
+            symptoms_text, 
+            member_age=profile['age'],
+            member_sex=profile['sex'],
+            region=region,
+            member_id=profile['id']
+        )
     
-    analysis, previous_context = get_gemini_symptom_analysis(
-        symptoms_text, 
-        region=region,
-        member_id=member_id
-    )
+    # Save symptoms and insight
+    symptom_record = save_symptoms(profile['id'], symptoms_text)
     
-    # Save insight for symptoms too (without report_id)
-    if member_id and analysis:
-        # Save symptom insight without report_id (set to NULL)
-        saved_insight = save_insight(member_id, None, analysis)
-        if saved_insight:
-            print(f"✅ Symptom insight saved to database")
+    # Save the primary insight
+    if analysis:
+        saved_insight = save_insight(profile['id'], None, analysis)
     
-    # Add contextual information
-    if previous_context and "PREVIOUS INSIGHTS" in previous_context:
-        analysis += "\n\n📊 *Analysis includes historical context from previous reports*"
+    # Store for sequential analysis count
+    st.session_state.sequential_analysis_count = 1
+    st.session_state.temp_insight = analysis
     
-    add_message("assistant", analysis, ["✅ Add to Timeline", "📄 Upload Report"])
+    # Show primary insight and next steps
+    response = f"## 🔍 Primary Insight for {profile['name']}\n\n"
+    response += f"{analysis}\n\n"
+    response += "### What would you like to do next?"
     
-    st.session_state.temp_symptoms = symptoms_text
-    st.session_state.bot_state = "welcome"
+    buttons = ["📄 Add Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]
+    
+    # If this was part of "Both" input, automatically proceed to report
+    if getattr(st.session_state, 'pending_both', False):
+        st.session_state.pending_both = False
+        add_message("assistant", f"✅ Symptoms recorded for {profile['name']}\n\nNow please upload the medical report:")
+        st.session_state.bot_state = "awaiting_report"
+    else:
+        add_message("assistant", response, buttons)
+        st.session_state.bot_state = "awaiting_more_input"
 def handle_add_to_timeline():
     """Handle adding symptoms to timeline - ask who it's for"""
     if st.session_state.current_profiles:
@@ -989,19 +1236,66 @@ def handle_add_to_timeline():
         add_message("assistant", "Who is this for?", ["🙋 Myself", "👶 Child", "👨 Parent", "Someone else"])
         st.session_state.bot_state = "awaiting_profile_selection"
 
+def process_health_input_for_profile(profile):
+    """Process health input based on the selected input type"""
+    input_type = st.session_state.pending_input_type
+    
+    if input_type == "🤒 Check Symptoms":
+        add_message("assistant", f"Please describe the symptoms for {profile['name']} (e.g., 'fever and headache for 2 days')")
+        st.session_state.bot_state = "awaiting_symptom_input"
+        st.session_state.temp_profile = profile
+        
+    elif input_type == "📄 Upload Report":
+        add_message("assistant", f"Please upload the medical report for {profile['name']} (PDF format)")
+        st.session_state.bot_state = "awaiting_report"
+        st.session_state.temp_profile = profile
+        
+    elif input_type == "Both":
+        # CHANGED: For returning users with "Both", also ask for report first
+        add_message("assistant", f"Let's start with the medical report for {profile['name']}. Please upload it (PDF format)")
+        st.session_state.bot_state = "awaiting_report"
+        st.session_state.temp_profile = profile
+        st.session_state.pending_both_returning = True  # Different flag for returning users
+        
 def handle_profile_selection(selection):
-    """Handle profile selection for symptoms"""
+    """Handle profile selection for the current input"""
     add_message("user", selection)
     
-    if selection == "Someone else" or not any(selection.startswith(p['name']) for p in st.session_state.current_profiles):
-        # Need to create new profile
-        if selection in ["🙋 Myself", "👶 Child", "👨 Parent"]:
-            add_message("assistant", "Please share their name and age (e.g., 'Aarav, 4' or 'Dad, 60')")
-        else:
-            add_message("assistant", "Please share their name and age or date of birth (e.g., 'Aarav, 4' or 'Dad, 60')")
+    # Handle profile creation AFTER insight (new user flow)
+    if st.session_state.bot_state == "awaiting_post_insight_profile":
+        relationship_map = {
+            "🙋 Myself": "Self",
+            "👶 Child": "Child", 
+            "💑 Spouse": "Spouse",
+            "👥 Other": "Other"
+        }
+        relationship = relationship_map[selection]
         
+        prompt_text = f"Please share { 'your' if relationship == 'Self' else 'their' } name and age (e.g., 'Aarav, 4')"
+        add_message("assistant", prompt_text)
+        st.session_state.bot_state = "awaiting_name_age_new_user"
+        st.session_state.pending_relationship = relationship
+        return
+    
+    # Handle "Add New" cases for returning users (existing logic)
+    if selection in ["👶 Add Child", "💑 Add Spouse", "👥 Add Other", "👶 Child", "💑 Spouse", "👥 Other"]:
+        relationship_map = {
+            "👶 Add Child": "Child", "👶 Child": "Child",
+            "💑 Add Spouse": "Spouse", "💑 Spouse": "Spouse", 
+            "👥 Add Other": "Other", "👥 Other": "Other"
+        }
+        relationship = relationship_map[selection]
+        
+        if selection in ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]:
+            prompt_text = f"Please share their name and age (e.g., 'Aarav, 4')"
+        else:
+            prompt_text = f"Please share the {relationship.lower()}'s name and age (e.g., 'Aarav, 4')"
+        
+        add_message("assistant", prompt_text)
         st.session_state.bot_state = "awaiting_name_age"
-    else:
+        st.session_state.pending_relationship = relationship
+        
+    elif any(selection.startswith(p['name']) for p in st.session_state.current_profiles):
         # Existing profile selected
         selected_profile = None
         for profile in st.session_state.current_profiles:
@@ -1009,24 +1303,8 @@ def handle_profile_selection(selection):
                 selected_profile = profile
                 break
         
-        if selected_profile and st.session_state.temp_symptoms:
-            # Save symptoms to this profile
-            save_symptoms(selected_profile['id'], st.session_state.temp_symptoms)
-            
-            response = f"✅ Created timeline for {selected_profile['name']} ({selected_profile['age']}y)\n\n"
-            
-            # Add insight based on age and previous insights
-            previous_insights = get_previous_insights(selected_profile['id'], limit=1)
-            if previous_insights:
-                response += f"💡 Sequential Analysis: This adds to {len(previous_insights)} previous health record(s) for better pattern tracking."
-            else:
-                response += f"💡 Insight: Starting health timeline for {selected_profile['name']}."
-            
-            add_message("assistant", response, ["🤒 Check More Symptoms", "📄 Upload Report"])
-            
-            st.session_state.temp_symptoms = ""
-            st.session_state.bot_state = "welcome"
-
+        if selected_profile:
+            process_health_input_for_profile(selected_profile)
 def parse_name_age_sex(input_text):
     """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya 4 Female'"""
     try:
@@ -1099,83 +1377,29 @@ def handle_name_age_input(name_age_text):
             add_message("assistant", "Sorry, couldn't create the profile. Please try again.", ["🤒 Check Symptoms"])
             st.session_state.bot_state = "welcome"
 
-def process_uploaded_report(uploaded_file):
-    """Process uploaded report and handle profile selection"""
-    add_message("user", f"Uploaded: {uploaded_file.name}")
-    
-    # Extract text from PDF
-    with st.spinner("Processing report..."):
-        report_text = extract_text_from_pdf(uploaded_file)
-    
-    # Debug: Show first 500 chars of extracted text
-    print(f"Extracted text sample: {report_text[:500]}")
-    
-    labs_data = {"labs": []}
-    lab_score = 15
-    
-    if report_text and GEMINI_AVAILABLE:
-        labs_data, lab_score = get_health_score_from_gemini(report_text, {})
-        print(f"Extracted {len(labs_data.get('labs', []))} lab tests")
-        print(f"Lab score: {lab_score}/25")
-    
-    if not report_text:
-        add_message("assistant", "❌ Could not read the PDF file. Please try another file.", 
-                   ["📄 Upload Report", "🤒 Check Symptoms"])
-        st.session_state.bot_state = "welcome"
-        return
-    
-    st.session_state.temp_report_text = report_text
-    st.session_state.temp_labs_data = labs_data  # Store labs data for scoring
-    
-    # Store that we're processing a report
-    st.session_state.processing_report = True
-    
-    # Ask which profile this is for
-    if st.session_state.current_profiles:
-        profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
-        profile_buttons.append("Someone else")
-        
-        add_message("assistant", "Report received. Is this for one of your profiles?", profile_buttons)
-        st.session_state.bot_state = "awaiting_profile_selection"
-        st.session_state.pending_action = "report"
-    else:
-        add_message("assistant", "Report received. Who is this for? Please share name and age (e.g., 'Dad, 65')")
-        st.session_state.bot_state = "awaiting_name_age"
-        st.session_state.pending_action = "report"   
-
-def handle_report_symptoms_input(symptoms_text):
-    """Handle symptom input specifically for report correlation"""
+def handle_symptoms_for_both_returning(symptoms_text):
+    """Handle symptoms input when returning user selected 'Both'"""
     add_message("user", symptoms_text)
     
-    profile = st.session_state.temp_profile_for_report
-    report_text = st.session_state.temp_report_text_storage
-    labs_data = getattr(st.session_state, 'temp_labs_data', {"labs": []})
+    profile = st.session_state.temp_profile
+    report_text = st.session_state.temp_report_for_both_returning
+    labs_data = getattr(st.session_state, 'temp_labs_data_returning', {"labs": []})
     
-    # Process "none" or similar responses
+    # Process symptoms
     symptoms_lower = symptoms_text.lower()
     if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
         symptoms_to_store = "No symptoms reported - routine checkup"
         symptom_severity = 1
     else:
         symptoms_to_store = symptoms_text
-        # Simple severity estimation based on keywords
-        if any(word in symptoms_lower for word in ['severe', 'emergency', 'urgent', 'critical', 'extreme']):
-            symptom_severity = 5
-        elif any(word in symptoms_lower for word in ['moderate', 'medium', 'persistent', 'chronic']):
-            symptom_severity = 3
-        elif any(word in symptoms_lower for word in ['mild', 'slight', 'minor', 'occasional']):
-            symptom_severity = 2
-        else:
-            symptom_severity = 2  # Default
+        symptom_severity = 2
     
-    # Save symptoms first
+    # Save symptoms and report
     symptom_record = save_symptoms(profile['id'], symptoms_to_store, symptom_severity)
-    
-    # Now save the medical report with symptom correlation
     report = save_medical_report(profile['id'], report_text)
     
-    if report and symptom_record:
-        # Update the report with symptom severity
+    # Update report with symptom data
+    if report:
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1184,9 +1408,9 @@ def handle_report_symptoms_input(symptoms_text):
                 )
                 conn.commit()
         except Exception as e:
-            st.error(f"Error updating report with symptom data: {e}")
+            st.error(f"Error updating report: {e}")
     
-    # Calculate comprehensive health score
+    # Calculate health score
     health_scores = calculate_comprehensive_health_score(
         profile['id'], 
         report_text, 
@@ -1194,7 +1418,7 @@ def handle_report_symptoms_input(symptoms_text):
         labs_data
     )
     
-    # Save health scores to database
+    # Save health scores
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1219,11 +1443,10 @@ def handle_report_symptoms_input(symptoms_text):
     except Exception as e:
         st.error(f"Error saving health scores: {e}")
     
-    # Get Gemini AI insight for the report WITH symptom context
+    # Generate insight
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
-    with st.spinner("Analyzing report with symptom context..."):
-        # Enhanced prompt that includes symptoms
+    with st.spinner("Generating comprehensive insight..."):
         insight = get_gemini_report_insight(
             report_text, 
             symptoms_to_store, 
@@ -1233,49 +1456,223 @@ def handle_report_symptoms_input(symptoms_text):
             report['id'] if report else None
         )
     
-    # Save the insight to the database
+    # Save insight
     if insight and report:
-        # Extract just the insight text without the emoji prefix for storage
         insight_text = insight.replace("🔍 Routine Insight:", "").replace("🔍 Symptom-Correlated Insight:", "").strip()
         saved_insight = save_insight(profile['id'], report['id'], insight_text)
-        
-        if saved_insight:
-            print(f"✅ Insight saved to database with ID: {saved_insight['id']}")
-        else:
-            print("❌ Failed to save insight to database")
     
-    # Build response message with health score
-    if symptoms_lower in ['none', 'no', 'no symptoms']:
-        response = f"✅ **Routine Checkup** recorded for {profile['name']}\n\n"
-    else:
-        response = f"✅ **Symptom-Report Correlation** saved for {profile['name']}\n\n"
-    
+    # Build response
+    response = f"## 📊 Comprehensive Insight for {profile['name']}\n\n"
+    response += f"{insight}\n\n"
     response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
-    response += f"{insight}"
+    response += "### What would you like to do next?"
     
-    # Add score breakdown in a compact format
-    response += f"\n\n📊 **Score Breakdown:** "
-    response += f"Labs: {health_scores['labs_vitals_score']:.1f} • "
-    response += f"Symptoms: {health_scores['symptoms_score']:.1f} • "
-    response += f"Habits: {health_scores['diseases_habits_score']:.1f} • "
-    response += f"Lifestyle: {health_scores['lifestyle_score']:.1f}"
-    
-    # Add sequential analysis context if available
-    previous_insights = get_previous_insights(profile['id'], limit=1)
-    if previous_insights:
-        response += f"\n\n📈 *Sequential analysis applied: Building on {len(previous_insights)} previous health record(s)*"
-    
-    buttons = ["🤒 Check Symptoms", "📄 Upload Another Report"]
+    buttons = ["📄 Add Another Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]
     add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_more_input"
     
-    # Clean up temporary state
-    st.session_state.temp_report_text = ""
-    st.session_state.temp_symptoms = ""
-    st.session_state.temp_profile_for_report = None
+    # Clean up
+    st.session_state.temp_report_for_both_returning = None
+    st.session_state.temp_labs_data_returning = None
+    st.session_state.pending_both_returning = False
+
+def process_uploaded_report(uploaded_file):
+    """Process uploaded report for returning users"""
+    add_message("user", f"Uploaded: {uploaded_file.name}")
+    
+    profile = st.session_state.temp_profile
+    
+    # Extract text from PDF
+    with st.spinner("Processing report..."):
+        report_text = extract_text_from_pdf(uploaded_file)
+    
+    if not report_text:
+        add_message("assistant", "❌ Could not read the PDF file. Please try another file.", 
+                   ["📄 Upload Report", "🤒 Check Symptoms"])
+        st.session_state.bot_state = "welcome"
+        return
+    
+    # Check if this is part of "Both" for returning users
+    if getattr(st.session_state, 'pending_both_returning', False):
+        # Store the report and ask for symptoms
+        st.session_state.temp_report_for_both_returning = report_text
+        
+        # Get lab data if available
+        labs_data = {"labs": []}
+        if report_text and GEMINI_AVAILABLE:
+            labs_data, _ = get_health_score_from_gemini(report_text, {})
+        st.session_state.temp_labs_data_returning = labs_data
+        
+        add_message("assistant", 
+                   f"✅ Report uploaded for {profile['name']}!\n\n"
+                   "Now, please describe the symptoms (e.g., 'fever and headache for 2 days')")
+        st.session_state.bot_state = "awaiting_symptoms_for_both_returning"
+    else:
+        # Single report upload - proceed with normal flow
+        st.session_state.temp_report_text = report_text
+        
+        # Get lab data if available
+        labs_data = {"labs": []}
+        lab_score = 15
+        if report_text and GEMINI_AVAILABLE:
+            labs_data, lab_score = get_health_score_from_gemini(report_text, {})
+        
+        # Ask about symptoms for correlation
+        add_message("assistant", 
+                   f"📋 To provide better analysis for {profile['name']}, were there any specific symptoms or health concerns?\n\n"
+                   f"💡 Examples: 'fever for 3 days', 'chest pain during exercise', or type 'none' for routine checkup")
+        
+        st.session_state.bot_state = "awaiting_report_symptoms"
+        st.session_state.temp_profile_for_report = profile
+        st.session_state.temp_report_text_storage = report_text
+        st.session_state.temp_labs_data = labs_data
+def handle_more_input_selection(selection):
+    """Handle the Add More/Finish options after primary insight"""
+    add_message("user", selection)
+    
+    profile = st.session_state.temp_profile
+    
+    if selection == "📄 Add Report" or selection == "📄 Add Another Report":
+        add_message("assistant", f"Please upload the medical report for {profile['name']} (PDF format)")
+        st.session_state.bot_state = "awaiting_report"
+        st.session_state.temp_profile = profile
+        
+    elif selection == "🤒 Add More Symptoms" or selection == "🤒 Add More Symptoms":
+        add_message("assistant", f"Please describe additional symptoms for {profile['name']}")
+        st.session_state.bot_state = "awaiting_symptom_input"
+        st.session_state.temp_profile = profile
+        
+    elif selection == "✅ Finish & Save Timeline":
+        # Save timeline and end session
+        response = f"## ✅ Timeline Saved for {profile['name']}\n\n"
+        response += f"Your health timeline has been updated with {st.session_state.sequential_analysis_count} input(s).\n\n"
+        response += "### Summary of Insights:\n"
+        response += f"- {st.session_state.temp_insight}\n\n"
+        response += "You can always come back to add more information!"
+        
+        add_message("assistant", response, ["🤒 Check Symptoms", "📄 Upload Report"])
+        
+        # Reset for next session
+        st.session_state.sequential_analysis_count = 0
+        st.session_state.temp_insight = ""
+        st.session_state.temp_profile = None
+        st.session_state.bot_state = "welcome"
+
+def handle_report_symptoms_input(symptoms_text):
+    """Handle symptom input for report correlation and generate insight"""
+    add_message("user", symptoms_text)
+    
+    profile = st.session_state.temp_profile_for_report
+    report_text = st.session_state.temp_report_text_storage
+    labs_data = getattr(st.session_state, 'temp_labs_data', {"labs": []})
+    
+    # Process symptoms
+    symptoms_lower = symptoms_text.lower()
+    if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
+        symptoms_to_store = "No symptoms reported - routine checkup"
+        symptom_severity = 1
+    else:
+        symptoms_to_store = symptoms_text
+        symptom_severity = 2  # Default
+    
+    # Save symptoms and report
+    symptom_record = save_symptoms(profile['id'], symptoms_to_store, symptom_severity)
+    report = save_medical_report(profile['id'], report_text)
+    
+    # Update report with symptom data
+    if report:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE medical_reports SET symptom_severity = %s WHERE id = %s",
+                    (symptom_severity, report['id'])
+                )
+                conn.commit()
+        except Exception as e:
+            st.error(f"Error updating report: {e}")
+    
+    # Calculate health score
+    health_scores = calculate_comprehensive_health_score(
+        profile['id'], 
+        report_text, 
+        symptoms_to_store, 
+        labs_data
+    )
+    
+    # Save health scores
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO health_scores 
+                (member_id, report_id, labs_vitals_score, symptoms_score, demographics_score, 
+                 upload_logs_score, diseases_habits_score, treatment_adherence_score, 
+                 lifestyle_score, final_score) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                profile['id'],
+                report['id'] if report else None,
+                health_scores['labs_vitals_score'],
+                health_scores['symptoms_score'],
+                health_scores['demographics_score'],
+                health_scores['upload_logs_score'],
+                health_scores['diseases_habits_score'],
+                health_scores['treatment_adherence_score'],
+                health_scores['lifestyle_score'],
+                health_scores['final_score']
+            ))
+            conn.commit()
+    except Exception as e:
+        st.error(f"Error saving health scores: {e}")
+    
+    # Generate insight
+    region = st.session_state.current_family.get('region') if st.session_state.current_family else None
+    
+    with st.spinner("Generating insight..."):
+        insight = get_gemini_report_insight(
+            report_text, 
+            symptoms_to_store, 
+            profile, 
+            region,
+            profile['id'],
+            report['id'] if report else None
+        )
+    
+    # Save insight
+    if insight and report:
+        insight_text = insight.replace("🔍 Routine Insight:", "").replace("🔍 Symptom-Correlated Insight:", "").strip()
+        saved_insight = save_insight(profile['id'], report['id'], insight_text)
+    
+    # Determine if this is primary or sequential insight
+    if st.session_state.sequential_analysis_count > 0:
+        insight_type = "Sequential Insight"
+        st.session_state.sequential_analysis_count += 1
+    else:
+        insight_type = "Primary Insight"
+        st.session_state.sequential_analysis_count = 1
+        st.session_state.temp_insight = insight
+    
+    # Build response
+    if symptoms_lower in ['none', 'no', 'no symptoms']:
+        response = f"## 📊 {insight_type} for {profile['name']}\n\n"
+    else:
+        response = f"## 📊 {insight_type} for {profile['name']}\n\n"
+    
+    response += f"{insight}\n\n"
+    response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
+    
+    if st.session_state.sequential_analysis_count > 1:
+        response += f"📈 *This analysis builds on {st.session_state.sequential_analysis_count-1} previous input(s)*\n\n"
+    
+    response += "### What would you like to do next?"
+    
+    buttons = ["📄 Add Another Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_more_input"
+    
+    # Clean up
     st.session_state.temp_report_text_storage = None
     st.session_state.temp_labs_data = None
-    st.session_state.bot_state = "welcome"
-
+    st.session_state.temp_profile_for_report = None
 def finalize_report_processing(profile):
     """Finalize report processing for a specific profile - now includes symptom correlation"""
     if st.session_state.temp_report_text:
@@ -1330,14 +1727,23 @@ def render_chat_interface():
                                 handle_chat_button(button_text)
                                 st.rerun()
     
-    # File uploader (conditionally displayed)
-    if st.session_state.bot_state == "awaiting_report":
+    # File uploader (conditionally displayed) - FIXED VERSION
+    if st.session_state.bot_state in ["awaiting_report", "awaiting_report_new_user"]:
         st.divider()
+        
+        # Use a stable key based on the state
+        uploader_key = f"report_uploader_{st.session_state.bot_state}"
+        
         uploaded_file = st.file_uploader("Upload medical report (PDF)", 
                                         type=["pdf"], 
-                                        key="report_uploader")
-        if uploaded_file:
-            process_uploaded_report(uploaded_file)
+                                        key=uploader_key)
+        
+        if uploaded_file is not None:
+            # Process the file based on current state
+            if st.session_state.bot_state == "awaiting_report_new_user":
+                process_new_user_report(uploaded_file)
+            else:
+                process_uploaded_report(uploaded_file)
             st.rerun()
     
     # User input
@@ -1362,77 +1768,178 @@ def reset_db_connection():
 
 def handle_chat_button(button_text):
     """Handle button clicks in chat"""
-    if button_text == "🤒 Check Symptoms":
-        handle_symptom_check()
-    elif button_text == "📄 Upload Report" or button_text == "📄 Upload Another Report":
+    if button_text in ["🤒 Check Symptoms", "📄 Upload Report", "Both"]:
+        handle_input_type_selection(button_text)
+    elif button_text in ["📄 Add Report", "📄 Add Another Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]:
+        handle_more_input_selection(button_text)
+    elif button_text == "📄 Upload Another Report":
         handle_report_upload()
-    elif button_text == "🤒 Check More Symptoms":
-        handle_symptom_check()
-    elif button_text == "✅ Add to Timeline":
-        handle_add_to_timeline()
-    elif button_text.startswith(("🙋", "👶", "👨")) or "Someone else" in button_text:
+    elif button_text.startswith(("🙋", "👶", "💑", "👥")) or "Someone else" in button_text:
+        handle_profile_selection(button_text)
+    elif button_text.startswith("👶 Add") or button_text.startswith("💑 Add") or button_text.startswith("👥 Add"):
         handle_profile_selection(button_text)
     elif any(button_text.startswith(p['name']) for p in st.session_state.current_profiles):
         # Existing profile selected
-        if st.session_state.pending_action == "symptom":
-            handle_profile_selection(button_text)
-        elif st.session_state.pending_action == "report":
-            # Find the selected profile and finalize report processing
-            for profile in st.session_state.current_profiles:
-                if button_text.startswith(profile['name']):
-                    add_message("user", button_text)
-                    finalize_report_processing(profile)  # This now triggers symptom asking
-                    break
+        for profile in st.session_state.current_profiles:
+            if button_text.startswith(profile['name']):
+                add_message("user", button_text)
+                st.session_state.temp_profile = profile
+                process_health_input_for_profile(profile)
+                break
+
+def handle_new_user_name_age_input(name_age_text):
+    """Handle name/age input for new users after primary insight"""
+    add_message("user", name_age_text)
+    
+    # Parse name, age, and gender
+    name, age, sex = parse_name_age_sex(name_age_text)
+    relationship = st.session_state.pending_relationship
+    
+    # Create the family member
+    if st.session_state.current_family:
+        new_member = create_family_member(st.session_state.current_family['id'], name, age, sex)
+        
+        if new_member:
+            st.session_state.current_profiles.append(new_member)
+            
+            # Now save the stored input data to the new profile
+            input_type = st.session_state.new_user_input_type
+            input_data = st.session_state.new_user_input_data
+            
+            if input_type == "🤒 Check Symptoms":
+                # Save symptoms
+                save_symptoms(new_member['id'], input_data)
+                # Save the insight
+                save_insight(new_member['id'], None, st.session_state.new_user_primary_insight)
+                
+            elif input_type == "📄 Upload Report":
+                # Save report and symptoms
+                report_data = input_data  # This is the dict with report_text, symptoms_text, labs_data
+                report = save_medical_report(new_member['id'], report_data["report_text"])
+                
+                # Save symptoms
+                save_symptoms(new_member['id'], report_data["symptoms_text"])
+                
+                # Calculate and save health score
+                health_scores = calculate_comprehensive_health_score(
+                    new_member['id'], 
+                    report_data["report_text"], 
+                    report_data["symptoms_text"], 
+                    report_data["labs_data"]
+                )
+                
+                # Save health scores
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO health_scores 
+                            (member_id, report_id, labs_vitals_score, symptoms_score, demographics_score, 
+                             upload_logs_score, diseases_habits_score, treatment_adherence_score, 
+                             lifestyle_score, final_score) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            new_member['id'],
+                            report['id'] if report else None,
+                            health_scores['labs_vitals_score'],
+                            health_scores['symptoms_score'],
+                            health_scores['demographics_score'],
+                            health_scores['upload_logs_score'],
+                            health_scores['diseases_habits_score'],
+                            health_scores['treatment_adherence_score'],
+                            health_scores['lifestyle_score'],
+                            health_scores['final_score']
+                        ))
+                        conn.commit()
+                except Exception as e:
+                    st.error(f"Error saving health scores: {e}")
+                
+                # Save insight
+                save_insight(new_member['id'], report['id'] if report else None, st.session_state.new_user_primary_insight)
+            
+            # Show success message and next steps
+            response = f"## ✅ Profile Created for {name}\n\n"
+            response += f"**{relationship}**: {name} ({age}y, {sex})\n\n"
+            response += f"### Primary Insight Saved:\n"
+            response += f"{st.session_state.new_user_primary_insight}\n\n"
+            response += "### What would you like to do next?"
+            
+            buttons = ["📄 Add Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]
+            
+            add_message("assistant", response, buttons)
+            st.session_state.bot_state = "awaiting_more_input"
+            
+            # Store the current profile for sequential inputs
+            st.session_state.temp_profile = new_member
+            
+            # Clean up new user states
+            st.session_state.new_user_primary_insight = ""
+            st.session_state.new_user_input_type = ""
+            st.session_state.new_user_input_data = ""
+            
+        else:
+            add_message("assistant", "Sorry, couldn't create the profile. Please try again.", 
+                       ["🤒 Check Symptoms", "📄 Upload Report"])
+            st.session_state.bot_state = "welcome"
+
 def handle_user_input(user_input):
     """Handle user text input based on current state"""
     if st.session_state.bot_state == "awaiting_symptom_input":
         process_symptom_input(user_input)
     
+    elif st.session_state.bot_state == "awaiting_symptom_input_new_user":
+        process_new_user_symptom_input(user_input)
+    
     elif st.session_state.bot_state == "awaiting_name_age":
         handle_name_age_input(user_input)
     
-    elif st.session_state.bot_state == "awaiting_report_symptoms":  # NEW STATE
+    elif st.session_state.bot_state == "awaiting_name_age_new_user":
+        handle_new_user_name_age_input(user_input)
+    
+    elif st.session_state.bot_state == "awaiting_report_symptoms":
         handle_report_symptoms_input(user_input)
     
+    elif st.session_state.bot_state == "awaiting_report_symptoms_new_user":
+        handle_new_user_report_symptoms(user_input)
+    
+    elif st.session_state.bot_state == "awaiting_symptoms_for_both_report":
+        handle_symptoms_for_both_report(user_input)
+    
+    # ADD THIS NEW STATE HANDLER
+    elif st.session_state.bot_state == "awaiting_symptoms_for_both_returning":
+        handle_symptoms_for_both_returning(user_input)
+    
+    elif st.session_state.bot_state == "awaiting_input_type":
+        # Allow text input for input type
+        if user_input.lower() in ["symptoms", "check symptoms", "symptom"]:
+            handle_input_type_selection("🤒 Check Symptoms")
+        elif user_input.lower() in ["report", "upload report", "upload"]:
+            handle_input_type_selection("📄 Upload Report")
+        elif user_input.lower() in ["both", "symptoms and report"]:
+            handle_input_type_selection("Both")
+        else:
+            add_message("assistant", "Please choose one of the options above or type: 'Symptoms', 'Report', or 'Both'")
+    
     elif st.session_state.bot_state == "awaiting_profile_selection":
-        # Handle text input for profile selection
         add_message("user", user_input)
-        add_message("assistant", "Please use the buttons above to select a profile or choose 'Someone else'")
+        add_message("assistant", "Please use the buttons above to select a profile")
+    
+    elif st.session_state.bot_state == "awaiting_post_insight_profile":
+        add_message("user", user_input)
+        add_message("assistant", "Please use the buttons above to select who this is for")
+    
+    elif st.session_state.bot_state == "awaiting_more_input":
+        if user_input.lower() in ["add report", "report", "upload"]:
+            handle_more_input_selection("📄 Add Report")
+        elif user_input.lower() in ["add symptoms", "symptoms", "more symptoms"]:
+            handle_more_input_selection("🤒 Add More Symptoms")
+        elif user_input.lower() in ["finish", "done", "save"]:
+            handle_more_input_selection("✅ Finish & Save Timeline")
+        else:
+            add_message("assistant", "Please use the buttons above or type: 'Add Report', 'Add Symptoms', or 'Finish'")
     
     else:
-        # General conversation
-        add_message("user", user_input)
+        handle_welcome()
         
-        # Check if input contains symptoms directly
-        symptom_keywords = ['fever', 'headache', 'pain', 'cough', 'cold', 'vomiting', 'tired', 'sick', 'hurt']
-        if any(keyword in user_input.lower() for keyword in symptom_keywords):
-            # Direct symptom input
-            region = st.session_state.current_family.get('region') if st.session_state.current_family else None
-            
-            # Check for member context for sequential analysis
-            member_id = None
-            if st.session_state.current_profiles and len(st.session_state.current_profiles) == 1:
-                member_id = st.session_state.current_profiles[0]['id']
-            
-            analysis, previous_context = get_gemini_symptom_analysis(user_input, region=region, member_id=member_id)
-            
-            if previous_context and "PREVIOUS INSIGHTS" in previous_context:
-                analysis += "\n\n📊 *Analysis includes historical context from previous reports*"
-            
-            add_message("assistant", analysis, ["✅ Add to Timeline", "📄 Upload Report"])
-            st.session_state.temp_symptoms = user_input
-        
-        elif any(word in user_input.lower() for word in ['hello', 'hi', 'hey']):
-            add_message("assistant", "Hello! How can I help with your health concerns today?",
-                       ["🤒 Check Symptoms", "📄 Upload Report"])
-        
-        elif any(word in user_input.lower() for word in ['report', 'upload', 'pdf', 'medical']):
-            handle_report_upload()
-        
-        else:
-            add_message("assistant", "I can help you analyze symptoms or medical reports. What would you like to do?",
-                       ["🤒 Check Symptoms", "📄 Upload Report"])
-
 def render_profile_completion(member_id, member_name):
     """Render profile completion form for habits and health metrics"""
     st.subheader(f"📋 Complete {member_name}'s Profile")
