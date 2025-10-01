@@ -17,7 +17,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAucG55i7_H5wJsvHV2cQh5utyqIbLHSVo"
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 20:  # Basic validation
@@ -34,11 +33,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-         host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -1226,6 +1225,9 @@ def process_health_input_for_profile(profile):
     """Process health input based on the selected input type"""
     input_type = st.session_state.pending_input_type
     
+    # Store the input type for use after profile creation
+    st.session_state.pending_input_type = input_type
+    
     if input_type == "🤒 Check Symptoms":
         add_message("assistant", f"Please describe the symptoms for {profile['name']} (e.g., 'fever and headache for 2 days')")
         st.session_state.bot_state = "awaiting_symptom_input"
@@ -1237,12 +1239,11 @@ def process_health_input_for_profile(profile):
         st.session_state.temp_profile = profile
         
     elif input_type == "Both":
-        # CHANGED: For returning users with "Both", also ask for report first
         add_message("assistant", f"Let's start with the medical report for {profile['name']}. Please upload it (PDF format)")
         st.session_state.bot_state = "awaiting_report"
         st.session_state.temp_profile = profile
-        st.session_state.pending_both_returning = True  # Different flag for returning users
-        
+        st.session_state.pending_both_returning = True     
+
 def handle_profile_selection(selection):
     """Handle profile selection for the current input"""
     add_message("user", selection)
@@ -1291,6 +1292,7 @@ def handle_profile_selection(selection):
         
         if selected_profile:
             process_health_input_for_profile(selected_profile)
+            
 def parse_name_age_sex(input_text):
     """Parse name, age and sex from input like 'Jeet, 26, M' or 'Riya 4.5 Female'"""
     try:
@@ -1338,23 +1340,33 @@ def handle_name_age_input(name_age_text):
         if new_member:
             st.session_state.current_profiles.append(new_member)
             
-            # Save symptoms if we have them
-            if st.session_state.temp_symptoms:
-                save_symptoms(new_member['id'], st.session_state.temp_symptoms)
+            # Check if there's a pending input type that should be continued
+            if hasattr(st.session_state, 'pending_input_type') and st.session_state.pending_input_type:
+                input_type = st.session_state.pending_input_type
                 
-                response = f"✅ Created timeline for {name} ({age}y, {sex})\n\n"
-                response += f"💡 Insight: Starting health monitoring for {name}. Future analyses will build on this baseline."
+                if input_type == "🤒 Check Symptoms":
+                    add_message("assistant", f"Please describe the symptoms for {name} (e.g., 'fever and headache for 2 days')")
+                    st.session_state.bot_state = "awaiting_symptom_input"
+                    st.session_state.temp_profile = new_member
+                    
+                elif input_type == "📄 Upload Report":
+                    add_message("assistant", f"Please upload the medical report for {name} (PDF format)")
+                    st.session_state.bot_state = "awaiting_report"
+                    st.session_state.temp_profile = new_member
+                    
+                elif input_type == "Both":
+                    add_message("assistant", f"Let's start with the medical report for {name}. Please upload it (PDF format)")
+                    st.session_state.bot_state = "awaiting_report"
+                    st.session_state.temp_profile = new_member
+                    st.session_state.pending_both_returning = True
                 
-                add_message("assistant", response, ["🤒 Check More Symptoms", "📄 Upload Report"])
-                st.session_state.temp_symptoms = ""
+                # Clear the pending input type
+                st.session_state.pending_input_type = None
+                
             else:
-                # If it's for report upload
-                if st.session_state.pending_action == "report" and st.session_state.temp_report_text:
-                    finalize_report_processing(new_member)
-                else:
-                    add_message("assistant", f"✅ Created profile for {name} ({age}y, {sex})", ["🤒 Check Symptoms", "📄 Upload Report"])
-            
-            st.session_state.bot_state = "welcome"
+                # If no pending input type, show default options
+                add_message("assistant", f"✅ Created profile for {name} ({age}y, {sex})", ["🤒 Check Symptoms", "📄 Upload Report"])
+                st.session_state.bot_state = "welcome"
         else:
             add_message("assistant", "Sorry, couldn't create the profile. Please try again.", ["🤒 Check Symptoms"])
             st.session_state.bot_state = "welcome"
@@ -2226,7 +2238,3 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
-
-
-
-
