@@ -8,7 +8,16 @@ from datetime import datetime, timedelta
 import json
 import uuid
 import re
-
+import pandas as pd
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import io
+from datetime import datetime
 # Page configuration
 st.set_page_config(
     page_title="Health AI Agent",
@@ -16,6 +25,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyAucG55i7_H5wJsvHV2cQh5utyqIbLHSVo"
@@ -193,17 +203,59 @@ def init_session_state():
         "new_user_input_type": "",
         "new_user_input_data": "",
         "awaiting_post_insight_profile": False,
-        # ADD THIS NEW STATE
-        "temp_report_for_both": None,  # Store report temporarily for "Both" flow
+        "temp_report_for_both": None,
+        # CONSENT STATES - SIMPLIFIED
+        "consent_given": False,
+        "show_consent_modal": False,  # ADD THIS LINE
     }
     
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
-
 init_session_state()
 
+def render_consent_modal():
+    """Render the consent modal for first-time users"""
+    # Clear any existing content
+    st.empty()
+    
+    # Center the content
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("## 🔬 Important Notice")
+        st.markdown("---")
+        
+        # Consent content
+        st.warning("""
+        ### AI-Generated Health Insights
+        
+        **Please read carefully before proceeding:**
+        
+        - The health insights provided are generated using **Artificial Intelligence**
+        - These are **NOT** medical diagnoses or treatment recommendations
+        - Always consult **qualified healthcare professionals** for medical decisions
+        - Your data is stored securely for personalized insights only
+        - AI content may have limitations in accuracy and completeness
+        """)
+        
+        st.info("**By clicking 'I Understand & Agree', you acknowledge this disclaimer.**")
+        
+        # Buttons
+        col_accept, col_info = st.columns(2)
+        
+        with col_accept:
+            if st.button("✅ I Understand & Agree", type="primary", use_container_width=True):
+                st.session_state.consent_given = True
+                st.session_state.show_consent_modal = False
+                # Clear the chat history to trigger welcome message
+                st.session_state.chat_history = []
+                st.rerun()
+        
+        with col_info:
+            if st.button("ℹ️ Learn More", use_container_width=True):
+                st.info("This AI assistant analyzes symptoms and medical reports to provide health insights. For detailed information about data usage and AI capabilities, please contact support.")
 # Utility functions
 def extract_text_from_pdf(uploaded_file):
     try:
@@ -2258,11 +2310,199 @@ def render_phone_or_create_profile():
                 if back_clicked:
                     st.session_state.create_family_mode = False
                     st.rerun()
-
+def generate_timeline_pdf(profile_id, profile_name):
+    """Generate a PDF timeline for a specific profile"""
+    try:
+        # Create a bytes buffer for the PDF
+        buffer = io.BytesIO()
+        
+        # Create the PDF document
+        doc = SimpleDocTemplate(buffer, pagesize=letter, 
+                              topMargin=0.5*inch, bottomMargin=0.5*inch,
+                              leftMargin=0.5*inch, rightMargin=0.5*inch)
+        
+        # Get styles
+        styles = getSampleStyleSheet()
+        
+        # Create custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=16,
+            spaceAfter=12,
+            textColor=colors.darkblue
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=12,
+            spaceAfter=6,
+            textColor=colors.darkblue
+        )
+        
+        normal_style = styles['Normal']
+        
+        # Content list
+        content = []
+        
+        # Title
+        content.append(Paragraph(f"Health Timeline Report - {profile_name}", title_style))
+        content.append(Spacer(1, 0.2*inch))
+        
+        # Profile Information
+        content.append(Paragraph("Profile Information", heading_style))
+        
+        # Get profile details
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, age, sex, created_at 
+                FROM family_members 
+                WHERE id = %s
+            """, (profile_id,))
+            profile_data = cur.fetchone()
+        
+        if profile_data:
+            profile_info = [
+                ["Name:", profile_data['name']],
+                ["Age:", f"{profile_data['age']} years"],
+                ["Gender:", profile_data['sex']],
+                ["Profile Created:", profile_data['created_at'].strftime("%Y-%m-%d %H:%M")],
+                ["Report Generated:", datetime.now().strftime("%Y-%m-%d %H:%M")]
+            ]
+            
+            profile_table = Table(profile_info, colWidths=[1.5*inch, 4*inch])
+            profile_table.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+            ]))
+            content.append(profile_table)
+        
+        content.append(Spacer(1, 0.2*inch))
+        
+        # Health Insights History
+        content.append(Paragraph("Health Insights History", heading_style))
+        
+        # Get insight history
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ih.insight_text, ih.created_at, mr.report_date
+                FROM insight_history ih
+                LEFT JOIN medical_reports mr ON ih.report_id = mr.id
+                WHERE ih.member_id = %s
+                ORDER BY ih.created_at DESC
+                LIMIT 20
+            """, (profile_id,))
+            insights = cur.fetchall()
+        
+        if insights:
+            for i, insight in enumerate(insights):
+                # Insight header with date
+                date_str = insight['created_at'].strftime("%Y-%m-%d %H:%M")
+                content.append(Paragraph(f"<b>Insight #{len(insights)-i} - {date_str}</b>", normal_style))
+                
+                # Insight text
+                insight_text = insight['insight_text'].replace("🔍", "").strip()
+                content.append(Paragraph(insight_text, normal_style))
+                
+                # Report date if available
+                if insight['report_date']:
+                    content.append(Paragraph(f"<i>Based on report from: {insight['report_date']}</i>", normal_style))
+                
+                content.append(Spacer(1, 0.1*inch))
+        else:
+            content.append(Paragraph("No insights recorded yet.", normal_style))
+        
+        content.append(Spacer(1, 0.2*inch))
+        
+        # Recent Symptoms
+        content.append(Paragraph("Recent Symptoms", heading_style))
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT symptoms_text, severity, created_at
+                FROM symptoms
+                WHERE member_id = %s
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (profile_id,))
+            symptoms = cur.fetchall()
+        
+        if symptoms:
+            for symptom in symptoms:
+                date_str = symptom['created_at'].strftime("%Y-%m-%d")
+                severity_text = f"Severity: {symptom['severity']}" if symptom['severity'] else ""
+                content.append(Paragraph(f"<b>{date_str}:</b> {symptom['symptoms_text']} {severity_text}", normal_style))
+                content.append(Spacer(1, 0.05*inch))
+        else:
+            content.append(Paragraph("No symptoms recorded.", normal_style))
+        
+        content.append(Spacer(1, 0.2*inch))
+        
+        # Health Scores Summary
+        content.append(Paragraph("Health Score History", heading_style))
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT final_score, created_at
+                FROM health_scores
+                WHERE member_id = %s
+                ORDER BY created_at DESC
+                LIMIT 5
+            """, (profile_id,))
+            scores = cur.fetchall()
+        
+        if scores:
+            score_data = [["Date", "Health Score"]]
+            for score in scores:
+                date_str = score['created_at'].strftime("%Y-%m-%d")
+                score_data.append([date_str, f"{score['final_score']:.1f}/100"])
+            
+            score_table = Table(score_data, colWidths=[2*inch, 1.5*inch])
+            score_table.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ]))
+            content.append(score_table)
+        else:
+            content.append(Paragraph("No health scores recorded.", normal_style))
+        
+        # Build PDF
+        doc.build(content)
+        
+        # Get PDF data
+        pdf_data = buffer.getvalue()
+        buffer.close()
+        
+        return pdf_data
+        
+    except Exception as e:
+        st.error(f"Error generating PDF: {e}")
+        return None
+    
 def main():
     """Main application function"""
-    # Initialize welcome message if chat is empty
-    if not st.session_state.chat_history and st.session_state.current_family:
+    
+    # Show consent modal for first-time users who haven't given consent
+    if (st.session_state.current_family and 
+        not st.session_state.consent_given):
+        st.session_state.show_consent_modal = True
+    
+    # Render consent modal if needed
+    if st.session_state.show_consent_modal:
+        render_consent_modal()
+        return  # Stop further execution until consent is given
+    
+    # Initialize welcome message if chat is empty and consent is given
+    if not st.session_state.chat_history and st.session_state.current_family and st.session_state.consent_given:
         handle_welcome()
     
     # Show appropriate interface
@@ -2308,41 +2548,65 @@ def main():
                         except:
                             score_display = "🏥 --/100"
                         
+                        # Create the profile card with download button integrated
                         card_html = f"""
-                    <div style="background-color: {color}; padding: 5px; border-radius: 10px; margin: 10px 0; border-left: 4px solid #4CAF50;">
+                    <div style="background-color: {color}; padding: 10px; border-radius: 10px; margin: 10px 0; border-left: 4px solid #4CAF50;">
                         <div style="display: flex; align-items: center; justify-content: space-between;">
-                            <div style="display: flex; align-items: center;">
-                                <div>
+                            <div style="display: flex; align-items: center; flex-grow: 1;">
+                                <div style="flex-grow: 1;">
                                     <h4 style="margin: 0; color: #333;">{profile['name']}</h4>
                                     <p style="margin: 0; color: #666;">Age: {profile['age']} years | Gender: {profile['sex']}</p>
                                     <p style="margin: 0; color: #666; font-weight: bold;">{score_display}</p>
                                 </div>
                             </div>
-                            <span style="font-size: 17px;">
-                                {'👶' if profile['age'] < 2 else 
-                                '👧' if profile['sex'].lower() == 'female' and profile['age'] < 5 else 
-                                '👦' if profile['sex'].lower() == 'male' and profile['age'] < 5 else 
-                                '👧' if profile['sex'].lower() == 'female' and profile['age'] < 12 else 
-                                '👦' if profile['sex'].lower() == 'male' and profile['age'] < 12 else 
-                                '👩' if profile['sex'].lower() == 'female' and profile['age'] < 20 else 
-                                '👨' if profile['sex'].lower() == 'male' and profile['age'] < 20 else 
-                                '👩‍💼' if profile['sex'].lower() == 'female' and profile['age'] < 40 else 
-                                '👨‍💼' if profile['sex'].lower() == 'male' and profile['age'] < 40 else 
-                                '👩‍🔧' if profile['sex'].lower() == 'female' and profile['age'] < 60 else 
-                                '👨‍🔧' if profile['sex'].lower() == 'male' and profile['age'] < 60 else 
-                                '👩‍🦳' if profile['sex'].lower() == 'female' and profile['age'] < 75 else 
-                                '👨‍🦳' if profile['sex'].lower() == 'male' and profile['age'] < 75 else 
-                                '👵' if profile['sex'].lower() == 'female' else 
-                                '👴'}
-                            </span>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <span style="font-size: 17px;">
+                                    {'👶' if profile['age'] < 2 else 
+                                    '👧' if profile['sex'].lower() == 'female' and profile['age'] < 5 else 
+                                    '👦' if profile['sex'].lower() == 'male' and profile['age'] < 5 else 
+                                    '👧' if profile['sex'].lower() == 'female' and profile['age'] < 12 else 
+                                    '👦' if profile['sex'].lower() == 'male' and profile['age'] < 12 else 
+                                    '👩' if profile['sex'].lower() == 'female' and profile['age'] < 20 else 
+                                    '👨' if profile['sex'].lower() == 'male' and profile['age'] < 20 else 
+                                    '👩‍💼' if profile['sex'].lower() == 'female' and profile['age'] < 40 else 
+                                    '👨‍💼' if profile['sex'].lower() == 'male' and profile['age'] < 40 else 
+                                    '👩‍🔧' if profile['sex'].lower() == 'female' and profile['age'] < 60 else 
+                                    '👨‍🔧' if profile['sex'].lower() == 'male' and profile['age'] < 60 else 
+                                    '👩‍🦳' if profile['sex'].lower() == 'female' and profile['age'] < 75 else 
+                                    '👨‍🦳' if profile['sex'].lower() == 'male' and profile['age'] < 75 else 
+                                    '👵' if profile['sex'].lower() == 'female' else 
+                                    '👴'}
+                                </span>
+                            </div>
                         </div>
                     </div>
                     """
                         st.markdown(card_html, unsafe_allow_html=True)
-    
-    # Display health score history in sidebar
-                        # display_health_score_history(profile['id'])
                         
+                        # Download button integrated within the card area
+                        if st.button("📥 Download Timeline", 
+                                   key=f"download_{profile['id']}", 
+                                   help=f"Download {profile['name']}'s health timeline PDF",
+                                   use_container_width=True):
+                            with st.spinner(f"Generating PDF for {profile['name']}..."):
+                                pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
+                                
+                                if pdf_data:
+                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+                                    st.download_button(
+                                        label="Download Now",
+                                        data=pdf_data,
+                                        file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
+                                        mime="application/pdf",
+                                        key=f"pdf_download_{profile['id']}",
+                                        use_container_width=True
+                                    )
+                                else:
+                                    st.error("Failed to generate PDF")
+                        
+                        # Add spacing between profiles
+                        st.markdown("<div style='margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+    
                     # Prompt for incomplete profiles
                     prompt_profile_completion()
 if __name__ == "__main__":
