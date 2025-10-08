@@ -42,11 +42,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-         host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -245,13 +245,11 @@ def render_consent_modal():
         st.warning("""
         ### AI-Generated Health Insights
         
-        **Please read carefully before proceeding:**
+        Please read carefully before proceeding:
         
         - The health insights provided are generated using **Artificial Intelligence**
-        - These are **NOT** medical diagnoses or treatment recommendations
-        - Always consult **qualified healthcare professionals** for medical decisions
-        - Your data is stored securely for personalized insights only
-        - AI content may have limitations in accuracy and completeness
+        - Consent to the collection, storage, and processing of me and my family's health data
+        - Including by automated systems or AI models to generate health insights and timelines, as per the Privacy Policy.
         """)
         
         st.info("**By clicking 'I Understand & Agree', you acknowledge this disclaimer.**")
@@ -268,8 +266,32 @@ def render_consent_modal():
                 st.rerun()
         
         with col_info:
-            if st.button("ℹ️ Learn More", use_container_width=True):
-                st.info("This AI assistant analyzes symptoms and medical reports to provide health insights. For detailed information about data usage and AI capabilities, please contact support.")
+            if st.button("ℹ️ Privacy Policy", use_container_width=True):
+                st.info("""MVP Privacy Policy Wording
+1. Data We Collect
+- Health information you provide (symptoms, reports)
+- Profile information (name, age, relation, contact info)
+- Timeline and sequential data for generating insights
+2. How We Use Your Data
+- To provide primary, sequential, and predictive health insights
+- To maintain your personal health timeline
+- To improve our platform (anonymized data for research/AI training if authorized)
+3. Who Can Access Your Data
+- Authorized platform systems and personnel
+- AI or automated systems used for generating insights
+4. Sharing & Third Parties
+- Data is not sold or shared outside without your consent
+- Anonymized data may be used for research or analytics
+5. Security
+- Data is encrypted in storage and transit
+- Access is restricted to authorized systems
+6. Consent & Rights
+- You can withdraw consent at any time
+- You can edit or delete profiles
+- Consent covers you and any family members you add
+7. Updates
+- Privacy policy may change; we will notify users
+- Continued use after updates implies acceptance""")
 # Utility functions
 def extract_text_from_pdf(uploaded_file):
     try:
@@ -377,6 +399,227 @@ def save_insight(member_id, report_id, insight_text):
         st.error(f"Error saving insight: {e}")
         print(f"Detailed error: {e}")
         return None
+
+def get_gemini_report_insight(report_text, symptoms_text, member_data=None, region=None, member_id=None, report_id=None):
+    """Get medical report analysis with 15-day cycle-based insights"""
+    if not GEMINI_AVAILABLE:
+        if symptoms_text.lower() != "no symptoms reported - routine checkup":
+            return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Manual review recommended.", 1, 1, 0
+        else:
+            return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash-lite-preview')
+        
+        # Get current cycle info FIRST
+        current_cycle, days_in_cycle = get_current_cycle_info(member_id)
+        
+        # Get the CURRENT sequence number for this cycle (before saving new report)
+        current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
+        print(f"📊 Current sequence for member {member_id}, cycle {current_cycle}: {current_sequence}")
+        
+        # Determine if we need a new cycle
+        should_new_cycle = should_start_new_cycle(member_id)
+        
+        if should_new_cycle:
+            # Start a new cycle
+            current_cycle = current_cycle + 1
+            current_sequence = 1
+            is_new_cycle = True
+            print(f"🔄 Starting NEW cycle #{current_cycle}")
+        else:
+            # Continue in current cycle
+            is_new_cycle = False
+            print(f"📊 Continuing cycle #{current_cycle}, sequence #{current_sequence}")
+        
+        # Determine insight type based on sequence in current cycle
+        if current_sequence == 1:
+            insight_type = "primary"
+        elif current_sequence in [2, 3]:
+            insight_type = "sequential" 
+        else:
+            insight_type = "predictive"
+        
+        print(f"🎯 Insight type: {insight_type} for sequence {current_sequence}")
+        
+        # Get previous reports for context (only from current cycle)
+        previous_reports_context = ""
+        if current_sequence > 1:
+            previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, limit=min(current_sequence-1, 3))
+            if previous_reports:
+                previous_reports_context = "\n\nPREVIOUS REPORTS IN CURRENT CYCLE:\n"
+                for i, prev_report in enumerate(previous_reports, 1):
+                    prev_date = prev_report['report_date'] or prev_report.get('created_at', 'Unknown date')
+                    prev_text_preview = prev_report['report_text'][:500] + "..." if len(prev_report['report_text']) > 500 else prev_report['report_text']
+                    previous_reports_context += f"Report {prev_report['sequence_number']} ({prev_date}): {prev_text_preview}\n\n"
+        
+        member_info = ""
+        if member_data:
+            member_info = f"Patient: {member_data['name']} ({member_data['age']}y), Sex: {member_data.get('sex', 'Not specified')}, Region: {region if region else 'Not specified'}"
+        
+        # Build prompt based on insight type and cycle
+        if is_new_cycle:
+            prompt = f"""
+Analyze this FIRST MEDICAL REPORT as the START OF A NEW 15-DAY HEALTH MONITORING CYCLE and provide a structured primary insight.
+
+Context:
+
+This is the FIRST report in the patient's timeline
+
+This begins a NEW 15-day health monitoring cycle (Cycle #{current_cycle})
+
+Previous cycles have been archived for long-term tracking
+
+Summary of Previous Reports: {previous_reports_context}
+
+Patient information: {member_info}
+
+Reported Symptoms: {symptoms_text}
+
+Medical Report:
+{report_text[:3000]}
+
+Provide the insight in the following structured format:
+
+Key finding - The most important symptom or observation
+
+Probable diagnosis - The most likely condition based on the report and symptoms
+
+Next step - Immediate recommended action, test, or follow-up
+
+Fresh baseline assessment - Summary baseline for this new 15-day cycle
+
+Comparison with historical patterns (if available) - Any reference to past cycles or reports
+
+Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format
+"""
+        
+        elif insight_type == "primary":
+            prompt = f"""
+Analyze this FIRST MEDICAL REPORT and provide a structured primary insight.
+
+This is the patient's FIRST medical report in the system.
+
+Reported Symptoms:
+{symptoms_text}
+Full Medical Report (use ALL information in this report for analysis — do not limit to a specific number of characters):
+{report_text}
+Give the final output in the following clear and short format:
+
+Key finding - Summarize the most important and relevant symptoms and abnormal results in plain language (no long lists or unnecessary details).
+
+Probable diagnosis - Mention the most likely condition(s) based on all findings. Keep it brief and understandable.
+
+Next step - Short, practical recommendation on what should be done next (e.g., follow-up, tests, consultation).
+
+⚠️ Important:
+
+Analyze the entire report before giving the result.
+
+Keep the output short, clear, and human-readable.
+
+Do not add extra explanation or meta notes.
+"""
+        
+        elif insight_type == "sequential":
+            prompt = f"""
+Analyze the following medical report in chronological sequence with all previous reports and generate a structured sequential insight.
+
+Context:
+
+This is Report #{current_sequence} in the patient's medical timeline.
+
+Patient Details: {member_info} (Note: Do not include patient names or identifying information in the output)
+
+Reported Symptoms: {symptoms_text}
+
+Summary of Previous Reports: {previous_reports_context}
+
+Current Medical Report:
+{report_text[:3000]}
+
+Your task is to interpret the progression logically and clinically.
+
+Provide the output in exactly the following structured format (no extra text or explanations):
+
+New Findings: Clearly list new abnormalities, lab deviations, or clinical notes not seen in prior reports.
+
+Progress Assessment: Compare with the last report — specify if the condition is Improving, Worsening, or Stable, and justify briefly.
+
+Clinical Implications: Summarize what the new pattern suggests medically (e.g., infection control, metabolic decline, organ function change).
+
+Recommended Next Step: Suggest a focused next action — further diagnostic test, monitoring frequency, or specialist referral.
+
+Timestamp: Date and time of this report (use exact value if available, else "Unknown").
+
+Rules:
+
+Do not include or reveal any patient name or identifying information in the output.
+
+Maintain medical tone and objectivity.
+
+Avoid repetition of previous findings unless relevant to the change.
+
+Focus only on evolution between reports.
+
+Do not include disclaimers or meta-comments.
+"""
+        
+        else:  # predictive insight
+            prompt = f"""
+Analyze this medical report with PREDICTIVE capabilities based on historical sequence and provide a **comprehensive structured insight**.
+
+Context:
+- This is report #{current_sequence} in the patient's timeline
+- Patient information: {member_info}
+- Reported Symptoms: {symptoms_text}
+{previous_reports_context}
+
+Current Medical Report:
+{report_text[:3000]}
+
+Provide the insight in the following structured format:
+
+1. Trend - How symptoms, signs, or scores are evolving over time
+2. Risk prediction - Likely progression, complications, or deterioration
+3. Suggested action - Preventive measures or immediate next steps
+4. Health score trend - Predicted risk level or score trajectory
+5. Timeline reference - Relevant dates for the observed trends and predictions
+
+Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
+"""
+        
+        response = model.generate_content(prompt)
+        insight_text = response.text.strip()
+        
+        # Clean up the response - remove any meta-commentary
+        if "Here's" in insight_text and "analysis" in insight_text.lower():
+            # Split by the actual insight content
+            lines = insight_text.split('\n')
+            # Find the first line that starts with structured content
+            for i, line in enumerate(lines):
+                if re.match(r'^\d+\.\s+[A-Za-z]', line) or 'Trend:' in line or 'Key finding:' in line:
+                    insight_text = '\n'.join(lines[i:])
+                    break
+        
+        # Save the insight sequence information - THIS IS CRITICAL
+        if member_id and report_id:
+            success, saved_cycle, saved_sequence = save_insight_sequence(member_id, report_id, current_sequence, insight_type)
+            if success:
+                print(f"💾 Saved sequence: Cycle {saved_cycle}, Sequence {saved_sequence}, Type: {insight_type}")
+            else:
+                print("❌ Failed to save sequence")
+        
+        return insight_text, current_cycle, current_sequence, days_in_cycle
+        
+    except Exception as e:
+        st.error(f"Gemini AI error: {e}")
+        print(f"Error details: {str(e)}")
+        
+        if symptoms_text.lower() != "no symptoms reported - routine checkup":
+            return f"🔍 Insight: Report correlated with symptoms: {symptoms_text}. Analysis completed.", 1, 1, 0
+        else:
+            return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
 
 def get_health_score_from_gemini(report_text, current_profiles=None, report_data=None):
     """
@@ -490,203 +733,6 @@ def get_member_habits(member_id):
         st.error(f"Error fetching habits: {e}")
         return []
     
-def get_gemini_report_insight(report_text, symptoms_text, member_data=None, region=None, member_id=None, report_id=None):
-    """Get medical report analysis with 15-day cycle-based insights"""
-    if not GEMINI_AVAILABLE:
-        if symptoms_text.lower() != "no symptoms reported - routine checkup":
-            return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Manual review recommended.", 1, 1, 0
-        else:
-            return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
-    
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash-lite-preview')
-        
-        # Get current cycle info FIRST
-        current_cycle, days_in_cycle = get_current_cycle_info(member_id)
-        
-        # Determine if we need a new cycle
-        should_new_cycle = should_start_new_cycle(member_id)
-        
-        if should_new_cycle:
-            # Start a new cycle
-            current_cycle = current_cycle + 1
-            current_sequence = 1
-            is_new_cycle = True
-            print(f"🔄 Starting NEW cycle #{current_cycle}")
-        else:
-            # Continue in current cycle - get the NEXT sequence number
-            current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
-            is_new_cycle = False
-            print(f"📊 Continuing cycle #{current_cycle}, sequence #{current_sequence}")
-        
-        # Determine insight type based on sequence in current cycle
-        if current_sequence == 1:
-            insight_type = "primary"
-        elif current_sequence in [2, 3]:
-            insight_type = "sequential" 
-        else:
-            insight_type = "predictive"
-        
-        print(f"🎯 Insight type: {insight_type} for sequence {current_sequence}")
-        
-        # Get previous reports for context (only from current cycle)
-        previous_reports_context = ""
-        if current_sequence > 1:
-            previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, limit=min(current_sequence-1, 3))
-            if previous_reports:
-                previous_reports_context = "\n\nPREVIOUS REPORTS IN CURRENT CYCLE:\n"
-                for i, prev_report in enumerate(previous_reports, 1):
-                    prev_date = prev_report['report_date'] or prev_report.get('created_at', 'Unknown date')
-                    prev_text_preview = prev_report['report_text'][:500] + "..." if len(prev_report['report_text']) > 500 else prev_report['report_text']
-                    previous_reports_context += f"Report {prev_report['sequence_number']} ({prev_date}): {prev_text_preview}\n\n"
-        
-        member_info = ""
-        if member_data:
-            member_info = f"Patient: {member_data['name']} ({member_data['age']}y), Sex: {member_data.get('sex', 'Not specified')}, Region: {region if region else 'Not specified'}"
-        
-        # Build prompt based on insight type and cycle
-        if is_new_cycle:
-            prompt = f"""
-Analyze this FIRST MEDICAL REPORT as the START OF A NEW 15-DAY HEALTH MONITORING CYCLE and provide a structured primary insight.
-
-Context:
-
-This is the FIRST report in the patient's timeline
-
-This begins a NEW 15-day health monitoring cycle (Cycle #{current_cycle})
-
-Previous cycles have been archived for long-term tracking
-
-Summary of Previous Reports: {previous_reports_context}
-
-Patient information: {member_info}
-
-Reported Symptoms: {symptoms_text}
-
-Medical Report:
-{report_text[:3000]}
-
-Provide the insight in the following structured format:
-
-Key finding - The most important symptom or observation
-
-Probable diagnosis - The most likely condition based on the report and symptoms
-
-Next step - Immediate recommended action, test, or follow-up
-
-Fresh baseline assessment - Summary baseline for this new 15-day cycle
-
-Comparison with historical patterns (if available) - Any reference to past cycles or reports
-
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format
-"""
-        
-        elif insight_type == "primary":
-            prompt = f"""
-Analyze this FIRST MEDICAL REPORT and provide a **structured primary insight**.
-
-Context:
-- This is the FIRST report in the patient's timeline
-- Patient information: {member_info}
-- Reported Symptoms: {symptoms_text}
-
-Medical Report:
-{report_text[:3000]}
-
-Provide the insight in the following structured format:
-
-1. Key finding - What is most important symptom or observation
-2. Probable diagnosis - Most likely condition based on the report and symptoms
-3. Next step - Immediate recommended action, test, or follow-up
-
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
-"""
-        
-        elif insight_type == "sequential":
-            prompt = f"""
-Analyze the following medical report in chronological sequence with all previous reports and generate a **structured sequential insight**.
-
-Context:
-- This is Report #{current_sequence} in the patient's medical timeline.
-- Patient Details: {member_info}
-- Reported Symptoms: {symptoms_text}
-- Summary of Previous Reports: {previous_reports_context}
-
-Current Medical Report:
-{report_text[:3000]}
-
-Your task is to interpret the progression logically and clinically.
-
-Provide the output in **exactly the following structured format** (no extra text or explanations):
-
-1. **New Findings:** Clearly list new abnormalities, lab deviations, or clinical notes not seen in prior reports.
-2. **Progress Assessment:** Compare with the last report — specify if the condition is *Improving*, *Worsening*, or *Stable*, and justify briefly.
-3. **Clinical Implications:** Summarize what the new pattern suggests medically (e.g., infection control, metabolic decline, organ function change).
-4. **Recommended Next Step:** Suggest a focused next action — further diagnostic test, monitoring frequency, or specialist referral.
-5. **Timestamp:** Date and time of this report (use exact value if available, else "Unknown").
-
-Rules:
-- Maintain medical tone and objectivity.
-- Avoid repetition of previous findings unless relevant to the change.
-- Focus only on evolution between reports.
-- Do not include disclaimers or meta-comments.
-"""
-        
-        else:  # predictive insight
-            prompt = f"""
-Analyze this medical report with PREDICTIVE capabilities based on historical sequence and provide a **comprehensive structured insight**.
-
-Context:
-- This is report #{current_sequence} in the patient's timeline
-- Patient information: {member_info}
-- Reported Symptoms: {symptoms_text}
-{previous_reports_context}
-
-Current Medical Report:
-{report_text[:3000]}
-
-Provide the insight in the following structured format:
-
-1. Trend - How symptoms, signs, or scores are evolving over time
-2. Risk prediction - Likely progression, complications, or deterioration
-3. Suggested action - Preventive measures or immediate next steps
-4. Health score trend - Predicted risk level or score trajectory
-5. Timeline reference - Relevant dates for the observed trends and predictions
-
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
-"""
-        
-        response = model.generate_content(prompt)
-        insight_text = response.text.strip()
-        
-        # Clean up the response - remove any meta-commentary
-        if "Here's" in insight_text and "analysis" in insight_text.lower():
-            # Split by the actual insight content
-            lines = insight_text.split('\n')
-            # Find the first line that starts with structured content
-            for i, line in enumerate(lines):
-                if re.match(r'^\d+\.\s+[A-Za-z]', line) or 'Trend:' in line or 'Key finding:' in line:
-                    insight_text = '\n'.join(lines[i:])
-                    break
-        
-        # Save the insight sequence information - THIS IS CRITICAL
-        if member_id and report_id:
-            success, saved_cycle, saved_sequence = save_insight_sequence(member_id, report_id, current_sequence, insight_type)
-            if success:
-                print(f"💾 Saved sequence: Cycle {saved_cycle}, Sequence {saved_sequence}, Type: {insight_type}")
-            else:
-                print("❌ Failed to save sequence")
-        
-        return insight_text, current_cycle, current_sequence, days_in_cycle
-        
-    except Exception as e:
-        st.error(f"Gemini AI error: {e}")
-        print(f"Error details: {str(e)}")
-        
-        if symptoms_text.lower() != "no symptoms reported - routine checkup":
-            return f"🔍 Insight: Report correlated with symptoms: {symptoms_text}. Analysis completed.", 1, 1, 0
-        else:
-            return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
 
 def save_member_habits(member_id, habits_data):
     """Save or update habits for a family member"""
@@ -1172,7 +1218,7 @@ def handle_input_type_selection(input_type):
     else:
         # RETURNING USERS: Choose profile first (existing flow)
         profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
-        profile_buttons.extend(["👶 Add Child", "💑 Add Spouse", "👥 Add Other"])
+        profile_buttons.extend(["🙋 Myself","👶 Add Child", "💑 Add Spouse", "👥 Add Other"])
         
         add_message("assistant", 
                    "Who is this health information for?",
@@ -1268,6 +1314,7 @@ def handle_new_user_report_symptoms(symptoms_text):
     # Clean up
     st.session_state.temp_report_text_storage = None
     st.session_state.temp_labs_data = None
+
 def process_new_user_report(uploaded_file):
     """Process report for new users (before profile creation)"""
     add_message("user", f"Uploaded: {uploaded_file.name}")
@@ -1305,28 +1352,33 @@ def process_new_user_report(uploaded_file):
             "labs_data": labs_data
         }
         
-        # For new users, we need to track that this is their FIRST report
-        # so that when they upload a second one, it becomes sequential
-        st.session_state.new_user_report_count = 1  # Track that this is the first report
-        
         # Generate primary insight without member context
         region = st.session_state.current_family.get('region') if st.session_state.current_family else None
         
         with st.spinner("Generating insight..."):
             # For new users, always use primary insight for first report
-            insight = get_gemini_report_insight_new_user(
+            insight_result = get_gemini_report_insight(
                 report_text, 
                 "No symptoms reported - routine checkup", 
-                is_first_report=True
+                None,  # No member data
+                region,
+                None,  # No member ID
+                None   # No report ID
             )
         
+        # EXTRACT JUST THE INSIGHT TEXT FROM THE TUPLE
+        if isinstance(insight_result, tuple) and len(insight_result) >= 1:
+            insight_text = insight_result[0]  # First element is the insight text
+        else:
+            insight_text = insight_result
+        
         # Store the primary insight
-        st.session_state.new_user_primary_insight = insight
+        st.session_state.new_user_primary_insight = insight_text
         st.session_state.sequential_analysis_count = 1
         
         # Show primary insight and prompt for profile creation
         response = f"## 🔍 Primary Insight\n\n"
-        response += f"{insight}\n\n"
+        response += f"{insight_text}\n\n"
         response += "Now, let's create a profile to save this information. Who is this report for?"
         
         buttons = ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]
@@ -1348,22 +1400,29 @@ def get_gemini_report_insight_new_user(report_text, symptoms_text, is_first_repo
         if is_first_report:
             # First report for new user - Primary Insight
             prompt = f"""
-Analyze this FIRST MEDICAL REPORT and provide a **structured primary insight**.
+Analyze this FIRST MEDICAL REPORT and provide a structured primary insight.
 
 This is the patient's FIRST medical report in the system.
 
-Reported Symptoms: {symptoms_text}
+Reported Symptoms:
+{symptoms_text}
+Full Medical Report (use ALL information in this report for analysis — do not limit to a specific number of characters):
+{report_text}
+Give the final output in the following clear and short format:
 
-Medical Report:
-{report_text[:3000]}
+Key finding - Summarize the most important and relevant symptoms and abnormal results in plain language (no long lists or unnecessary details).
 
-Provide the insight in the following structured format:
+Probable diagnosis - Mention the most likely condition(s) based on all findings. Keep it brief and understandable.
 
-1. Key finding - What is most important symptom or observation
-2. Probable diagnosis - Most likely condition based on the report and symptoms
-3. Next step - Immediate recommended action, test, or follow-up
+Next step - Short, practical recommendation on what should be done next (e.g., follow-up, tests, consultation).
 
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
+⚠️ Important:
+
+Analyze the entire report before giving the result.
+
+Keep the output short, clear, and human-readable.
+
+Do not add extra explanation or meta notes.
 """
         else:
             # Subsequent report for new user - Sequential Insight
@@ -1410,6 +1469,120 @@ Return ONLY the insight text. Do not include any additional explanations, analys
         else:
             return "🔍 Insight: Routine checkup report stored successfully."
 
+def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence_number):
+    """Get medical report analysis for new users with proper sequencing for Both option"""
+    if not GEMINI_AVAILABLE:
+        if symptoms_text.lower() != "no symptoms reported - routine checkup":
+            return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Manual review recommended."
+        else:
+            return "🔍 Insight: Routine checkup report stored successfully."
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash-lite-preview')
+        
+        # Determine insight type based on sequence number
+        if sequence_number == 1:
+            insight_type = "primary"
+        elif sequence_number in [2, 3]:
+            insight_type = "sequential"
+        else:
+            insight_type = "predictive"
+        
+        print(f"🎯 New User Both - Sequence {sequence_number}, Type: {insight_type}")
+        
+        if insight_type == "primary":
+            prompt = f"""
+Analyze this FIRST MEDICAL REPORT and provide a structured primary insight.
+
+This is the patient's FIRST medical report in the system.
+
+Reported Symptoms:
+{symptoms_text}
+Full Medical Report (use ALL information in this report for analysis — do not limit to a specific number of characters):
+{report_text}
+Give the final output in the following clear and short format:
+
+Key finding - Summarize the most important and relevant symptoms and abnormal results in plain language (no long lists or unnecessary details).
+
+Probable diagnosis - Mention the most likely condition(s) based on all findings. Keep it brief and understandable.
+
+Next step - Short, practical recommendation on what should be done next (e.g., follow-up, tests, consultation).
+
+⚠️ Important:
+
+Analyze the entire report before giving the result.
+
+Keep the output short, clear, and human-readable.
+
+Do not add extra explanation or meta notes.
+"""
+        
+        elif insight_type == "sequential":
+            prompt = f"""
+Analyze this medical report in sequence and provide a **structured sequential insight**.
+
+This is report #{sequence_number} in the patient's medical timeline.
+
+Reported Symptoms: {symptoms_text}
+
+Medical Report:
+{report_text[:3000]}
+
+Your task is to interpret this as a follow-up report.
+
+Provide the output in **exactly the following structured format** (no extra text or explanations):
+
+1. **New Findings:** Clearly list new abnormalities, lab deviations, or clinical notes
+2. **Progress Assessment:** Compare with expected progression — specify if the condition is *Improving*, *Worsening*, or *Stable*
+3. **Clinical Implications:** Summarize what the current findings suggest medically
+4. **Recommended Next Step:** Suggest a focused next action
+
+Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
+"""
+        
+        else:  # predictive insight
+            prompt = f"""
+Analyze this medical report with PREDICTIVE capabilities and provide a **comprehensive structured insight**.
+
+This is report #{sequence_number} in the patient's timeline.
+
+Reported Symptoms: {symptoms_text}
+
+Medical Report:
+{report_text[:3000]}
+
+Provide the insight in the following structured format:
+
+1. Trend - How symptoms, signs, or scores are evolving over time
+2. Risk prediction - Likely progression, complications, or deterioration
+3. Suggested action - Preventive measures or immediate next steps
+4. Health score trend - Predicted risk level or score trajectory
+5. Timeline reference - Relevant dates for the observed trends and predictions
+
+Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
+"""
+        
+        response = model.generate_content(prompt)
+        insight_text = response.text.strip()
+        
+        # Clean up the response
+        if "Here's" in insight_text and "analysis" in insight_text.lower():
+            lines = insight_text.split('\n')
+            for i, line in enumerate(lines):
+                if re.match(r'^\d+\.\s+[A-Za-z]', line) or 'Trend:' in line or 'Key finding:' in line:
+                    insight_text = '\n'.join(lines[i:])
+                    break
+        
+        return insight_text
+        
+    except Exception as e:
+        st.error(f"Gemini AI error: {e}")
+        
+        if symptoms_text.lower() != "no symptoms reported - routine checkup":
+            return f"🔍 Insight: Report correlated with symptoms: {symptoms_text}. Analysis completed."
+        else:
+            return "🔍 Insight: Routine checkup report stored successfully."
+
 def handle_symptoms_for_both_report(symptoms_text):
     """Handle symptoms input when user selected 'Both' (report already uploaded)"""
     add_message("user", symptoms_text)
@@ -1431,27 +1604,25 @@ def handle_symptoms_for_both_report(symptoms_text):
         "labs_data": labs_data
     }
     
-    # Generate primary insight without member context
+    # Generate insight - use the same approach as report-only
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
     with st.spinner("Generating comprehensive insight..."):
-        insight = get_gemini_report_insight(
+        # For new users without profile, we can't use member_id, so use simple approach
+        insight_text = get_gemini_report_insight_new_user_both(
             report_text, 
             symptoms_to_store, 
-            None,  # No member data
-            region,
-            None,  # No member ID
-            None   # No report ID
+            1  # Always use sequence 1 for first report in Both flow
         )
     
     # Store the primary insight
-    st.session_state.new_user_primary_insight = insight
+    st.session_state.new_user_primary_insight = insight_text
     st.session_state.sequential_analysis_count = 1
     
-    # Show primary insight and prompt for profile creation
-    response = f"## 🔍 Comprehensive Primary Insight\n\n"
+    # Show insight and prompt for profile creation
+    response = f"## 🔍 Primary Insight\n\n"
     response += f"**Based on both report and symptoms:**\n\n"
-    response += f"{insight}\n\n"
+    response += f"{insight_text}\n\n"
     response += "Now, let's create a profile to save this information. Who is this for?"
     
     buttons = ["🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]
@@ -1514,7 +1685,9 @@ def get_sequence_number_for_cycle(member_id, cycle_number):
             """, (member_id, cycle_number))
             result = cur.fetchone()
             next_sequence = (result['max_sequence'] or 0) + 1
-            print(f"🔢 Next sequence for member {member_id}, cycle {cycle_number}: {next_sequence}")
+            print(f"🔢 DEBUG - Member {member_id}, Cycle {cycle_number}:")
+            print(f"   - Max sequence in DB: {result['max_sequence']}")
+            print(f"   - Next sequence: {next_sequence}")
             return next_sequence
     except Exception as e:
         print(f"Error getting sequence number for cycle: {e}")
@@ -1660,8 +1833,9 @@ def handle_profile_selection(selection):
         return
     
     # Handle "Add New" cases for returning users (existing logic)
-    if selection in ["👶 Add Child", "💑 Add Spouse", "👥 Add Other", "👶 Child", "💑 Spouse", "👥 Other"]:
+    if selection in ["🙋 Add Myself","👶 Add Child", "💑 Add Spouse", "👥 Add Other","🙋 Myself", "👶 Child", "💑 Spouse", "👥 Other"]:
         relationship_map = {
+            "🙋 Myself": "Self","🙋 Myself":"Self",
             "👶 Add Child": "Child", "👶 Child": "Child",
             "💑 Add Spouse": "Spouse", "💑 Spouse": "Spouse", 
             "👥 Add Other": "Other", "👥 Other": "Other"
@@ -1936,7 +2110,7 @@ def process_report_directly(profile, report_text):
     except Exception as e:
         st.error(f"Error saving health scores: {e}")
     
-    # Generate insight with new cycle-based logic - EXTRACT ONLY THE INSIGHT TEXT
+    # Generate insight with proper sequence detection
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
     with st.spinner("Generating insight..."):
@@ -1945,8 +2119,8 @@ def process_report_directly(profile, report_text):
             symptoms_to_store, 
             profile, 
             region,
-            profile['id'],
-            report['id'] if report else None
+            profile['id'],  # Now we have member_id
+            report['id'] if report else None  # Now we have report_id
         )
     
     # Extract just the insight text from the tuple
@@ -1968,37 +2142,25 @@ def process_report_directly(profile, report_text):
         
         saved_insight = save_insight(profile['id'], report['id'], insight_text_clean)
     
-    # Build response based on cycle and sequence
-    current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
-    
-    if current_sequence == 1 and days_in_cycle >= 15:
-        response = f"## 🔄 New Cycle #{current_cycle} Started\n\n"
-        response += f"**Previous cycle archived • Day 1 of new 15-day period**\n\n"
-    elif current_sequence == 1:
-        response = f"## 📊 Primary Insight for {profile['name']}\n\n"
-        response += f"**Cycle #{current_cycle}, Day {days_in_cycle} • Report #1**\n\n"
+    # Build response based on sequence number
+    if current_sequence == 1:
+        response = f"## 🔍 Primary Insight for {profile['name']}\n\n"
+        response += f"**Report #1 • First Analysis**\n\n"
     elif current_sequence in [2, 3]:
-        response = f"## 📊 Sequential Insight for {profile['name']}\n\n"
-        response += f"**Cycle #{current_cycle}, Day {days_in_cycle} • Report #{current_sequence}**\n\n"
+        response = f"## 🔍 Sequential Insight for {profile['name']}\n\n"
+        response += f"**Report #{current_sequence} • Progress Analysis**\n\n"
     else:
-        response = f"## 📊 Comprehensive Insight for {profile['name']}\n\n"
-        response += f"**Cycle #{current_cycle}, Day {days_in_cycle} • Report #{current_sequence}**\n\n"
+        response = f"## 🔮 Predictive Insight for {profile['name']}\n\n"
+        response += f"**Report #{current_sequence} • Predictive Analysis**\n\n"
     
     response += f"{insight_text}\n\n"
     response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
-    
-    # Add cycle information
-    if days_in_cycle >= 15:
-        response += "📚 **Note: Previous cycle has been archived. New 15-day monitoring cycle started.**\n\n"
-    elif days_in_cycle >= 10:
-        response += f"⏰ **Cycle Progress: {days_in_cycle}/15 days completed**\n\n"
     
     response += "### What would you like to do next?"
     
     buttons = ["📄 Add Another Report", "🤒 Add Symptoms", "Both", "✅ Finish & Save Timeline"]
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_more_input"
-
 
 def process_uploaded_report(uploaded_file):
     """Process uploaded report for returning users"""
@@ -2042,14 +2204,11 @@ def handle_more_input_selection(selection):
     profile = st.session_state.temp_profile
     
     if selection == "📄 Add Report" or selection == "📄 Add Another Report":
-        # Check if this is a new user who just created their profile
-        if hasattr(st.session_state, 'new_user_report_count') and st.session_state.new_user_report_count == 1:
-            # This is their SECOND report - should be sequential
-            st.session_state.new_user_report_count = 2
-            add_message("assistant", f"Please upload the NEXT medical report for {profile['name']} (PDF format)")
-        else:
-            add_message("assistant", f"Please upload the medical report for {profile['name']} (PDF format)")
+        # ALWAYS use database sequence for returning users (after profile creation)
+        current_sequence = get_sequence_number_for_cycle(profile['id'], 1)
+        print(f"➡️ Continuing with database sequence #{current_sequence} for {profile['name']}")
         
+        add_message("assistant", f"Please upload the medical report for {profile['name']} (PDF format)")
         st.session_state.bot_state = "awaiting_report"
         st.session_state.temp_profile = profile
         
@@ -2326,9 +2485,9 @@ def handle_new_user_name_age_input(name_age_text):
                 # Save the insight
                 save_insight(new_member['id'], None, st.session_state.new_user_primary_insight)
                 
-            elif input_type == "📄 Upload Report":
-                # Save report and symptoms
-                report_data = input_data  # This is the dict with report_text, symptoms_text, labs_data
+            elif input_type == "📄 Upload Report" or input_type == "Both":
+                # For Both and Report, save report and symptoms
+                report_data = input_data
                 report = save_medical_report(new_member['id'], report_data["report_text"])
                 
                 # Save symptoms
@@ -2367,7 +2526,7 @@ def handle_new_user_name_age_input(name_age_text):
                 except Exception as e:
                     st.error(f"Error saving health scores: {e}")
                 
-                # CRITICAL: Save the insight sequence for the first report
+                # CRITICAL: Save the insight sequence for the first report - ALWAYS sequence 1
                 if report:
                     try:
                         with conn.cursor() as cur:
@@ -2376,7 +2535,7 @@ def handle_new_user_name_age_input(name_age_text):
                                 VALUES (%s, %s, %s, %s, %s)
                             """, (new_member['id'], report['id'], 1, "primary", 1))
                             conn.commit()
-                            print(f"✅ Saved first report sequence for new user: Member {new_member['id']}, Sequence 1")
+                            print(f"✅ Saved FIRST report sequence for member {new_member['id']}, Sequence 1")
                     except Exception as e:
                         print(f"Error saving first report sequence: {e}")
                 
@@ -2402,9 +2561,6 @@ def handle_new_user_name_age_input(name_age_text):
             st.session_state.new_user_primary_insight = ""
             st.session_state.new_user_input_type = ""
             st.session_state.new_user_input_data = ""
-            # Keep the report count for sequential tracking
-            if hasattr(st.session_state, 'new_user_report_count'):
-                st.session_state.new_user_report_count = 1  # First report is done
             
         else:
             add_message("assistant", "Sorry, couldn't create the profile. Please try again.", 
@@ -2659,7 +2815,7 @@ def render_phone_or_create_profile():
             
             with st.form("create_family", clear_on_submit=False):
                 head_name = st.text_input("Your Name", placeholder="Enter your name")
-                region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
+                #region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
                 
                 col_create, col_back = st.columns(2)
                 with col_create:
@@ -2669,7 +2825,7 @@ def render_phone_or_create_profile():
                 
                 if create_clicked:
                     if head_name:
-                        family = create_family(st.session_state.pending_phone, head_name, region)
+                        family = create_family(st.session_state.pending_phone, head_name)
                         if family:
                             st.session_state.current_family = family
                             st.session_state.current_profiles = []
