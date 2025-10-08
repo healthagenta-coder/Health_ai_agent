@@ -1756,24 +1756,18 @@ def process_symptom_input(symptoms_text):
         saved_insight = save_insight(profile['id'], None, analysis)
     
     # Store for sequential analysis count
-    st.session_state.sequential_analysis_count = 1
+    st.session_state.sequential_analysis_count += 1
     st.session_state.temp_insight = analysis
     
     # Show primary insight and next steps
-    response = f"## 🔍 Primary Insight for {profile['name']}\n\n"
+    response = f"## 🔍 Symptom Analysis for {profile['name']}\n\n"
     response += f"{analysis}\n\n"
     response += "### What would you like to do next?"
     
     buttons = ["📄 Add Report", "🤒 Add More Symptoms", "Both", "✅ Finish & Save Timeline"]
     
-    # If this was part of "Both" input, automatically proceed to report
-    if getattr(st.session_state, 'pending_both', False):
-        st.session_state.pending_both = False
-        add_message("assistant", f"✅ Symptoms recorded for {profile['name']}\n\nNow please upload the medical report:")
-        st.session_state.bot_state = "awaiting_report"
-    else:
-        add_message("assistant", response, buttons)
-        st.session_state.bot_state = "awaiting_more_input"
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_more_input"
 
 def handle_add_to_timeline():
     """Handle adding symptoms to timeline - ask who it's for"""
@@ -2204,7 +2198,7 @@ def handle_more_input_selection(selection):
     profile = st.session_state.temp_profile
     
     if selection == "📄 Add Report" or selection == "📄 Add Another Report":
-        # ALWAYS use database sequence for returning users (after profile creation)
+        # For returning users, get the current sequence from database
         current_sequence = get_sequence_number_for_cycle(profile['id'], 1)
         print(f"➡️ Continuing with database sequence #{current_sequence} for {profile['name']}")
         
@@ -2213,9 +2207,11 @@ def handle_more_input_selection(selection):
         st.session_state.temp_profile = profile
         
     elif selection == "🤒 Add More Symptoms" or selection == "🤒 Add Symptoms":
+        # FIX: Set the proper state for symptoms input
         add_message("assistant", f"Please describe additional symptoms for {profile['name']}")
         st.session_state.bot_state = "awaiting_symptom_input"
         st.session_state.temp_profile = profile
+        st.session_state.pending_action = "symptom"
         
     elif selection == "✅ Finish & Save Timeline":
         # Save timeline and end session
@@ -2236,7 +2232,6 @@ def handle_more_input_selection(selection):
     elif selection == "Both":
         # Handle Both option from the more input menu
         handle_input_type_selection("Both")
-
 def handle_report_symptoms_input(symptoms_text):
     """Handle symptom input for report correlation and generate insight"""
     add_message("user", symptoms_text)
@@ -2443,7 +2438,7 @@ def handle_chat_button(button_text):
     """Handle button clicks in chat"""
     if button_text in ["🤒 Check Symptoms", "📄 Upload Report", "Both"]:
         handle_input_type_selection(button_text)
-    elif button_text in ["📄 Add Report", "📄 Add Another Report", "🤒 Add More Symptoms", "✅ Finish & Save Timeline"]:
+    elif button_text in ["📄 Add Report", "📄 Add Another Report", "🤒 Add More Symptoms", "🤒 Add Symptoms", "✅ Finish & Save Timeline"]:
         handle_more_input_selection(button_text)
     elif button_text == "📄 Upload Another Report":
         handle_report_upload()
@@ -2590,7 +2585,6 @@ def handle_user_input(user_input):
     elif st.session_state.bot_state == "awaiting_symptoms_for_both_report":
         handle_symptoms_for_both_report(user_input)
     
-    # ADD THIS NEW STATE HANDLER
     elif st.session_state.bot_state == "awaiting_symptoms_for_both_returning":
         handle_symptoms_for_both_returning(user_input)
     
@@ -2617,15 +2611,15 @@ def handle_user_input(user_input):
         if user_input.lower() in ["add report", "report", "upload"]:
             handle_more_input_selection("📄 Add Report")
         elif user_input.lower() in ["add symptoms", "symptoms", "more symptoms"]:
-            handle_more_input_selection("🤒 Add More Symptoms")
+            handle_more_input_selection("🤒 Add Symptoms")
         elif user_input.lower() in ["finish", "done", "save"]:
             handle_more_input_selection("✅ Finish & Save Timeline")
         else:
             add_message("assistant", "Please use the buttons above or type: 'Add Report', 'Add Symptoms', or 'Finish'")
     
     else:
-        handle_welcome()
-        
+        handle_welcome()        
+
 def render_profile_completion(member_id, member_name):
     """Render profile completion form for habits and health metrics"""
     st.subheader(f"📋 Complete {member_name}'s Profile")
