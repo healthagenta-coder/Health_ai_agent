@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 # Initialize Gemini - Check if API key is valid
-GEMINI_API_KEY = "AIzaSyAucG55i7_H5wJsvHV2cQh5utyqIbLHSVo"
+GEMINI_API_KEY = "AIzaSyAucG55i7_H5wJsvHV2cQh5utyqIbLHSV"
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 20:  # Basic validation
     try:
         genai.configure(api_key=GEMINI_API_KEY)
@@ -3213,4 +3213,5 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
