@@ -698,7 +698,9 @@ def format_insight_for_display(insight_json, insight_type, sequence_number):
     else:  # predictive
         return f"""
 🔮 Predictive Insight (Report #{sequence_number}):
-
+**New Findings**:{insight_json.get('new_findings','Not specified')}
+**Change Since last**:{insight_json.get('change_since_last','Not specified')}
+**Updated Diagnosis**:{insight_json.get('updated_diagnosis','Not specified')}
 **Trend**: {insight_json.get('trend', 'Not specified')}
 **Risk Prediction**: {insight_json.get('risk_prediction', 'Not specified')}
 **Suggested Action**: {insight_json.get('suggested_action', 'Not specified')}
@@ -4132,4 +4134,5 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
 
