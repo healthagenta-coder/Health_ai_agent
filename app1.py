@@ -849,7 +849,7 @@ PREVIOUS HEALTH CONTEXT:
 {previous_reports_context}
 
 CURRENT MEDICAL REPORT:
-{report_text[:3000]}
+{report_text}
 
 IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 
@@ -864,61 +864,73 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
         
         elif insight_type == "primary":
             prompt = f"""
-You are a medical AI assistant analyzing health reports. Analyze this FIRST medical report and return ONLY a JSON object.
+You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
+Since no previous records are available, your analysis must rely entirely on **the current report** and **presenting symptoms**.
 
 CONTEXT:
-- First medical report in system
-- No previous health data available
+- This is the patient's FIRST medical record.
+- No prior health history or symptom evolution data is available.
+- Emphasize objective findings from the medical report. Use reported symptoms to support or contextualize these findings, not as the primary basis.
 
 PATIENT INFORMATION:
 {member_info}
 
-SYMPTOMS:
+PRESENTING SYMPTOMS:
 {symptoms_text}
 
-CURRENT MEDICAL REPORT:
-{report_text[:3000]}
+CURRENT MEDICAL REPORT (Primary Source of Truth):
+{report_text}
 
-IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
+ANALYSIS GUIDELINES:
+- Identify the most clinically significant finding or abnormality in the report.
+- Infer the most probable diagnosis based on objective findings and symptom context.
+- Recommend a clear and specific next step (e.g., diagnostic test, referral, monitoring, treatment initiation).
+- Avoid speculative or non-clinical language.
+- Be precise and medically structured.
+
+Return ONLY valid JSON in the following format:
 
 {{
-  "key_finding": "concise summary of most important finding",
-  "probable_diagnosis": "most likely medical condition",
-  "next_step": "specific immediate action recommended"
+  "key_finding": "Concise but medically meaningful summary of the most important abnormality or observation in the report",
+  "probable_diagnosis": "Most likely medical condition or clinical impression based on findings and symptoms",
+  "next_step": "Specific, actionable next step (e.g., test, referral, treatment, or follow-up) relevant to the finding"
 }}
+
 """
         
         elif insight_type == "sequential":
             prompt = f"""
-You are a medical AI assistant analyzing health reports. Analyze this report in sequence and return ONLY a JSON object.
+You are a medical AI assistant analyzing patient health reports over time. 
+Your goal is to extract meaningful medical insights by correlating **the current medical report findings** with **symptom evolution over previous reports**.
 
-CRITICAL CONTEXT - SYMPTOM EVOLUTION:
+SEQUENTIAL CONTEXT — PRIOR SYMPTOMS AND TRENDS:
 {previous_context}
 
 PATIENT INFORMATION:
 {member_info}
 
-CURRENT SYMPTOMS:
+CURRENT REPORTED SYMPTOMS:
 {symptoms_text}
 
-CURRENT MEDICAL REPORT:
-{report_text[:3000]}
+CURRENT MEDICAL REPORT (Primary Source of Truth):
+{report_text}
 
-IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
+ANALYSIS GUIDELINES:
+- Prioritize medical report findings (lab results, imaging, clinical notes, assessments).
+- Distinguish between **new findings** and **previously reported or persistent issues**.
+- Indicate whether previously observed symptoms have improved, worsened, or resolved.
+- Keep the output medically structured and concise.
+
+Return ONLY valid JSON in the following format:s
 
 {{
-  "new_findings": "Clearly list new abnormalities, lab deviations, or clinical notes not seen in prior reports",
-  "change_since_last": "Compare with the last report — specify if Improving, Worsening, or Stable with brief justification. MUST comment on whether any previous symptoms are still affecting the patient or have resolved",
-  "updated_diagnosis": "current clinical impression including specific reference to symptom progression",
-  "clinical_implications": "what the pattern suggests about symptom evolution and overall health trajectory",
-  "recommended_next_step": "specific next action based on symptom progression and new findings"
+  "new_findings": "List new lab or clinical findings in the report not seen before",
+  "change_since_last": "Describe how the current condition compares to the previous report — clearly state Improving, Worsening, or Stable and note persistence or resolution of prior symptoms",
+  "updated_diagnosis": "Current clinical impression integrating both the new report findings and symptom trajectory",
+  "clinical_implications": "Explain what these patterns indicate about the patient’s health status or disease course",
+  "recommended_next_step": "Specific recommended next steps (e.g., further tests, specialist consult, treatment change)"
 }}
 
-SPECIAL ATTENTION TO SYMPTOMS:
-- Track how symptoms have evolved from previous entries
-- Note if previous symptoms have resolved, improved, worsened, or persisted
-- Identify any new symptoms that have appeared
-- Correlate symptom changes with lab findings and reports
 """
         
         else:  # predictive insight
@@ -937,7 +949,7 @@ SYMPTOMS:
 {symptoms_text}
 
 CURRENT MEDICAL REPORT:
-{report_text[:3000]}
+{report_text}
 
 IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 
@@ -1997,29 +2009,38 @@ def get_gemini_report_insight_new_user(report_text, symptoms_text, is_first_repo
         if is_first_report:
             # First report for new user - Primary Insight
             prompt = f"""
-Analyze this FIRST MEDICAL REPORT and provide a structured primary insight.
+You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
+Since no previous records are available, your analysis must rely entirely on **the current report** and **presenting symptoms**.
 
-This is the patient's FIRST medical report in the system.
+CONTEXT:
+- This is the patient's FIRST medical record.
+- No prior health history or symptom evolution data is available.
+- Emphasize objective findings from the medical report. Use reported symptoms to support or contextualize these findings, not as the primary basis.
 
-Reported Symptoms:
+PATIENT INFORMATION:
+{member_info}
+
+PRESENTING SYMPTOMS:
 {symptoms_text}
-Full Medical Report (use ALL information in this report for analysis — do not limit to a specific number of characters):
+
+CURRENT MEDICAL REPORT (Primary Source of Truth):
 {report_text}
-Give the final output in the following clear and short format:
 
-Key finding - Summarize the most important and relevant symptoms and abnormal results in plain language (no long lists or unnecessary details).
+ANALYSIS GUIDELINES:
+- Identify the most clinically significant finding or abnormality in the report.
+- Infer the most probable diagnosis based on objective findings and symptom context.
+- Recommend a clear and specific next step (e.g., diagnostic test, referral, monitoring, treatment initiation).
+- Avoid speculative or non-clinical language.
+- Be precise and medically structured.
 
-Probable diagnosis - Mention the most likely condition(s) based on all findings. Keep it brief and understandable.
+Return ONLY valid JSON in the following format:
 
-Next step - Short, practical recommendation on what should be done next (e.g., follow-up, tests, consultation).
+{{
+  "key_finding": "Concise but medically meaningful summary of the most important abnormality or observation in the report",
+  "probable_diagnosis": "Most likely medical condition or clinical impression based on findings and symptoms",
+  "next_step": "Specific, actionable next step (e.g., test, referral, treatment, or follow-up) relevant to the finding"
+}}
 
-⚠️ Important:
-
-Analyze the entire report before giving the result.
-
-Keep the output short, clear, and human-readable.
-
-Do not add extra explanation or meta notes.
 """
         else:
             # Subsequent report for new user - Sequential Insight
@@ -2033,7 +2054,7 @@ Reported Symptoms: {symptoms_text}
 Summary of Previous Reports: {previous_reports_context}
 
 Current Medical Report:
-{report_text[:3000]}
+{report_text}
 
 Your task is to interpret the progression logically and clinically.
 
@@ -2110,29 +2131,38 @@ def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence
         
         if insight_type == "primary":
             prompt = f"""
-Analyze this FIRST MEDICAL REPORT and provide a structured primary insight.
+You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
+Since no previous records are available, your analysis must rely entirely on **the current report** and **presenting symptoms**.
 
-This is the patient's FIRST medical report in the system.
+CONTEXT:
+- This is the patient's FIRST medical record.
+- No prior health history or symptom evolution data is available.
+- Emphasize objective findings from the medical report. Use reported symptoms to support or contextualize these findings, not as the primary basis.
 
-Reported Symptoms:
+PATIENT INFORMATION:
+{member_info}
+
+PRESENTING SYMPTOMS:
 {symptoms_text}
-Full Medical Report (use ALL information in this report for analysis — do not limit to a specific number of characters):
+
+CURRENT MEDICAL REPORT (Primary Source of Truth):
 {report_text}
-Give the final output in the following clear and short format:
 
-Key finding - Summarize the most important and relevant symptoms and abnormal results in plain language (no long lists or unnecessary details).
+ANALYSIS GUIDELINES:
+- Identify the most clinically significant finding or abnormality in the report.
+- Infer the most probable diagnosis based on objective findings and symptom context.
+- Recommend a clear and specific next step (e.g., diagnostic test, referral, monitoring, treatment initiation).
+- Avoid speculative or non-clinical language.
+- Be precise and medically structured.
 
-Probable diagnosis - Mention the most likely condition(s) based on all findings. Keep it brief and understandable.
+Return ONLY valid JSON in the following format:
 
-Next step - Short, practical recommendation on what should be done next (e.g., follow-up, tests, consultation).
+{{
+  "key_finding": "Concise but medically meaningful summary of the most important abnormality or observation in the report",
+  "probable_diagnosis": "Most likely medical condition or clinical impression based on findings and symptoms",
+  "next_step": "Specific, actionable next step (e.g., test, referral, treatment, or follow-up) relevant to the finding"
+}}
 
-⚠️ Important:
-
-Analyze the entire report before giving the result.
-
-Keep the output short, clear, and human-readable.
-
-Do not add extra explanation or meta notes.
 """
         
         elif insight_type == "sequential":
@@ -2146,7 +2176,7 @@ Reported Symptoms: {symptoms_text}
 Summary of Previous Reports: {previous_reports_context}
 
 Current Medical Report:
-{report_text[:3000]}
+{report_text}
 
 Your task is to interpret this as a follow-up report.
 
@@ -2171,7 +2201,7 @@ Reported Symptoms: {symptoms_text}
 Summary of Previous Reports: {previous_reports_context}
 
 Current Medical Report:
-{report_text[:3000]}
+{report_text}
 
 Provide the insight in the following structured format:
 
@@ -4134,5 +4164,3 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
-
-
