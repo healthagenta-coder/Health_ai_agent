@@ -1118,6 +1118,7 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
         else:
             return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
 
+
 def get_symptom_progression_history(member_id):
     """Get a clean timeline of symptom progression for a member"""
     try:
@@ -1217,7 +1218,7 @@ def get_health_score_from_gemini(report_text, current_profiles=None, report_data
         return {"labs": []}, 15
 
 def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None, region=None, member_id=None):
-    """Get symptom analysis with structured data storage - FIXED VERSION"""
+    """Get symptom analysis with sequence-aware insight types - FIXED VERSION"""
     print(f"🔍 DEBUG: Starting symptom analysis for member {member_id}")
     
     if not GEMINI_AVAILABLE:
@@ -1227,35 +1228,154 @@ def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None,
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
+        # Get current cycle and sequence info
+        current_cycle, days_in_cycle = get_current_cycle_info(member_id)
+        current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
+        
+        print(f"📊 DEBUG: Member {member_id}, Cycle {current_cycle}, Current Sequence {current_sequence}")
+        
+        # Determine insight type based on sequence
+        if current_sequence == 1:
+            insight_type = "primary"
+        elif current_sequence in [2, 3]:
+            insight_type = "sequential"
+        else:
+            insight_type = "predictive"
+        
+        print(f"🎯 DEBUG: Symptom insight type: {insight_type} for sequence {current_sequence}")
+        
         # Get previous structured insights for context
         previous_context = ""
-        if member_id:
-            previous_insights = get_previous_structured_insights(member_id)
-            if previous_insights:
-                previous_context = "\n\nPREVIOUS HEALTH RECORDS:\n"
-                for insight in previous_insights[-2:]:  # Last 2 records
-                    data = insight['insight_data']
-                    previous_context += f"- Symptoms: {data.get('symptoms', 'None')}, Diagnosis: {data.get('diagnosis', 'Not specified')}, Score: {data.get('health_score', 'N/A')}\n"
+        if current_sequence > 1 and member_id:
+            previous_context = get_structured_context_for_gemini(member_id, current_sequence)
+            print(f"📚 DEBUG: Previous context length: {len(previous_context)}")
+            
+            # If context is empty, try to get previous reports directly
+            if not previous_context or len(previous_context) < 50:
+                print(f"⚠️ DEBUG: Previous context too short, fetching previous reports directly")
+                previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, 3)
+                if previous_reports:
+                    previous_context = "PREVIOUS MEDICAL RECORDS:\n\n"
+                    for prev_report in previous_reports:
+                        data = safe_json_parse(prev_report['insight_data'])
+                        previous_context += f"Report #{prev_report['sequence_number']} ({prev_report['created_at'].strftime('%Y-%m-%d')}):\n"
+                        previous_context += f"- Symptoms: {data.get('symptoms', 'None')}\n"
+                        previous_context += f"- Key Findings: {data.get('reports', 'None')}\n"
+                        previous_context += f"- Diagnosis: {data.get('diagnosis', 'Not specified')}\n"
+                        previous_context += f"- Recommendations: {data.get('next_steps', 'Not specified')}\n"
+                        if data.get('lab_summary'):
+                            previous_context += f"- Lab Results: {data['lab_summary']}\n"
+                        previous_context += "\n"
+                    print(f"✅ DEBUG: Fetched {len(previous_reports)} previous reports, context length: {len(previous_context)}")
         
-        prompt = f"""
-Analyze these symptoms and provide a structured analysis.
+        member_info = ""
+        if member_age or member_sex:
+            member_info = f"Patient Age: {member_age if member_age else 'Not specified'}, Sex: {member_sex if member_sex else 'Not specified'}, Region: {region if region else 'Not specified'}"
+        
+        # PRIMARY INSIGHT - First symptom entry
+        if insight_type == "primary":
+            prompt = f"""
+You are a medical AI assistant analyzing a patient's **first symptom report** in the system.
+Since no previous records are available, your analysis must rely entirely on **the current symptoms**.
 
+CONTEXT:
+- This is the patient's FIRST symptom entry.
+- No prior health history or symptom evolution data is available.
+- Focus on understanding the immediate clinical picture from the presenting symptoms.
+
+PATIENT INFORMATION:
+{member_info}
+
+PRESENTING SYMPTOMS:
+{symptoms_text}
+
+ANALYSIS GUIDELINES:
+- Identify the most likely conditions based on symptom presentation.
+- Assess symptom severity and urgency.
+- Recommend immediate steps for symptom management or medical evaluation.
+- Be precise and medically structured.
+- Avoid speculative language.
+
+Return ONLY valid JSON in the following format:
+
+{{
+  "likely_condition": "Most probable condition(s) based on symptom presentation",
+  "severity_level": "Mild/Moderate/Severe - assessment of symptom urgency",
+  "immediate_steps": "Immediate practical steps or when to seek medical attention",
+  "recommended_evaluation": "Type of medical evaluation suggested (e.g., general checkup, specialist, urgent care)"
+}}
+"""
+        
+        # SEQUENTIAL INSIGHT - Following up on previous symptoms/reports
+        elif insight_type == "sequential":
+            prompt = f"""
+You are a medical AI assistant analyzing a patient's symptom progression in relation to their **previous medical diagnosis**.
+Your goal is to determine if current symptoms are **consistent with, explain, or indicate changes** in their diagnosed condition.
+
+PREVIOUS MEDICAL DIAGNOSIS & FINDINGS (Reference):
 {previous_context}
 
-Symptoms: {symptoms_text}
-Patient Age: {member_age if member_age else 'Not specified'}
-Patient Sex: {member_sex if member_sex else 'Not specified'}
-Region: {region if region else 'Not specified'}
+PATIENT INFORMATION:
+{member_info}
 
-Provide your analysis in the following EXACT JSON format:
+CURRENT REPORTED SYMPTOMS:
+{symptoms_text}
+
+ANALYSIS GUIDELINES:
+- **Primary Task**: Assess if current symptoms are RESPONSIBLE FOR or EXPLAINED BY the previous medical diagnosis
+- Compare symptoms against the key findings and diagnosis from the previous report
+- Determine if symptoms indicate:
+  * Expected progression of the diagnosed condition
+  * Improvement/recovery from the condition
+  * Worsening/complication of the condition
+  * Resolution of the condition
+- Identify any NEW symptoms that were NOT mentioned in the previous diagnosis
+- Assess if symptoms suggest the patient is following medical recommendations
+- Recommend if additional medical evaluation or treatment adjustment is needed
+
+Return ONLY valid JSON in the following format:
+
 {{
-  "likely_condition": "Most likely condition or explanation",
-  "immediate_steps": "Immediate practical steps or lifestyle adjustments",
-  "relation_to_history": "Relation to previous health patterns if available",
-  "severity_assessment": "Assessment of symptom severity"
+  "symptoms_aligned_with_diagnosis": "YES/NO - Are current symptoms consistent with the previous diagnosis? Explain briefly.",
+  "symptom_responsibility": "Which current symptoms are explained by the previous diagnosis?",
+  "new_symptoms_noted": "Any symptoms reported now that were NOT in the previous medical report?",
+  "disease_progression": "Is the condition improving, stable, worsening, or progressing? Provide assessment.",
+  "clinical_assessment": "Overall assessment: Are symptoms following expected course or indicating complications/changes?",
+  "recommended_action": "Specific next steps (e.g., continue current treatment, seek follow-up consultation, urgent evaluation needed)"
 }}
+"""
+        
+        # PREDICTIVE INSIGHT - Long-term pattern analysis
+        else:  # predictive
+            prompt = f"""
+You are a medical AI assistant performing **predictive analysis** of patient health based on symptom patterns.
+Your goal is to identify trends, predict likely outcomes, and suggest preventive measures.
 
-Return ONLY the JSON object. No additional text or explanations.
+TIMELINE CONTEXT — SYMPTOM HISTORY AND PREVIOUS RECORDS:
+{previous_context}
+
+PATIENT INFORMATION:
+{member_info}
+
+CURRENT REPORTED SYMPTOMS:
+{symptoms_text}
+
+ANALYSIS GUIDELINES:
+- Analyze the overall symptom trajectory over time.
+- Predict likely disease progression or recovery based on patterns.
+- Identify risk factors and protective factors.
+- Suggest preventive or management strategies.
+- Consider long-term health implications.
+
+Return ONLY valid JSON in the following format:
+
+{{
+  "symptom_trend": "Overall trend in symptom pattern (Improving/Declining/Cyclical/Stable)",
+  "predicted_progression": "Likely progression if current pattern continues",
+  "risk_factors_identified": "Factors suggesting worsening or complications",
+  "protective_measures": "Preventive or management strategies to improve outcomes",
+  "long_term_recommendation": "Recommended monitoring or intervention for long-term health"
+}}
 """
         
         print(f"🤖 DEBUG: Sending symptom analysis prompt to Gemini")
@@ -1264,50 +1384,84 @@ Return ONLY the JSON object. No additional text or explanations.
         print(f"🤖 DEBUG: Gemini response received: {response_text[:200]}...")
         
         # Clean and parse JSON
-        if '```json' in response_text:
-            response_text = response_text.split('```json')[1].split('```')[0]
-        elif '```' in response_text:
-            response_text = response_text.split('```')[1].split('```')[0]
+        cleaned_response = response_text
+        
+        # Remove markdown code blocks
+        if '```json' in cleaned_response:
+            cleaned_response = cleaned_response.split('```json')[1].split('```')[0].strip()
+        elif '```' in cleaned_response:
+            cleaned_response = cleaned_response.split('```')[1].split('```')[0].strip()
+        
+        # Remove any text before the first {
+        if '{' in cleaned_response:
+            cleaned_response = cleaned_response[cleaned_response.index('{'):]
+        
+        # Remove any text after the last }
+        if '}' in cleaned_response:
+            cleaned_response = cleaned_response[:cleaned_response.rindex('}')+1]
         
         try:
-            analysis_json = json.loads(response_text)
+            analysis_json = json.loads(cleaned_response)
             print(f"✅ DEBUG: Successfully parsed symptom analysis JSON")
-        except json.JSONDecodeError:
-            print(f"❌ DEBUG: JSON parsing failed for symptom analysis")
-            analysis_json = {"raw_analysis": response_text}
+        except json.JSONDecodeError as e:
+            print(f"❌ DEBUG: JSON parsing failed, attempting fix: {e}")
+            try:
+                # Add quotes to unquoted keys
+                fixed_json = re.sub(r'(\w+):', r'"\1":', cleaned_response)
+                analysis_json = json.loads(fixed_json)
+                print(f"✅ DEBUG: Fixed JSON parsing")
+            except:
+                print(f"❌ DEBUG: JSON fixing failed, using fallback")
+                analysis_json = {"raw_analysis": response_text}
         
-        # Convert to readable text
+        # FORMAT OUTPUT BASED ON INSIGHT TYPE
         if "raw_analysis" in analysis_json:
             analysis_text = analysis_json["raw_analysis"]
-        else:
+        
+        elif insight_type == "primary":
             analysis_text = f"""
-🔍 Symptom Analysis:
+## 🔍 Primary Symptom Analysis (First Entry)
 
-**Likely Condition**: {analysis_json.get('likely_condition', 'Not specified')}
-**Immediate Steps**: {analysis_json.get('immediate_steps', 'Not specified')}
-**Relation to History**: {analysis_json.get('relation_to_history', 'Not specified')}
-**Severity**: {analysis_json.get('severity_assessment', 'Not specified')}
+**🩺 Likely Condition:** {analysis_json.get('likely_condition', 'Not specified')}
+
+**⚠️ Severity Level:** {analysis_json.get('severity_level', 'Not specified')}
+
+**🚨 Immediate Steps:** {analysis_json.get('immediate_steps', 'Not specified')}
+
+**📋 Recommended Evaluation:** {analysis_json.get('recommended_evaluation', 'Not specified')}
 """
         
-        # Save structured insight for symptoms-only input
-        if member_id:
-            structured_data = {
-                'symptoms': symptoms_text,
-                'reports': "None",
-                'diagnosis': analysis_json.get('likely_condition', 'Not specified'),
-                'next_steps': analysis_json.get('immediate_steps', 'Not specified'),
-                'health_score': 80,  # Default score for symptoms-only
-                'predictive_data': {},
-                'trend': analysis_json.get('relation_to_history'),
-                'risk': analysis_json.get('severity_assessment'),
-                'suggested_action': analysis_json.get('immediate_steps'),
-                'input_type': 'symptoms_only'
-            }
-            
-            # Get next sequence number for symptoms context (negative to indicate context-only)
-            current_sequence = get_sequence_number_for_cycle(member_id, 1)
-            save_structured_insight(member_id, None, -current_sequence, structured_data)
-            print(f"💾 DEBUG: Saved symptom analysis to structured_insights")
+        elif insight_type == "sequential":
+            analysis_text = f"""
+## 🔍 Sequential Symptom Analysis (Diagnosis Correlation)
+
+**✅ Symptoms Aligned with Diagnosis:** {analysis_json.get('symptoms_aligned_with_diagnosis', 'Not specified')}
+
+**🔗 Symptom Responsibility:** {analysis_json.get('symptom_responsibility', 'Not specified')}
+
+**🆕 New Symptoms Noted:** {analysis_json.get('new_symptoms_noted', 'Not specified')}
+
+**📈 Disease Progression:** {analysis_json.get('disease_progression', 'Not specified')}
+
+**🔬 Clinical Assessment:** {analysis_json.get('clinical_assessment', 'Not specified')}
+
+**🚨 Recommended Action:** {analysis_json.get('recommended_action', 'Not specified')}
+"""
+        
+        else:  # predictive
+            analysis_text = f"""
+## 🔮 Predictive Symptom Analysis (Long-term Trend)
+
+**📊 Symptom Trend:** {analysis_json.get('symptom_trend', 'Not specified')}
+
+**🔮 Predicted Progression:** {analysis_json.get('predicted_progression', 'Not specified')}
+
+**⚠️ Risk Factors Identified:** {analysis_json.get('risk_factors_identified', 'Not specified')}
+
+**✅ Protective Measures:** {analysis_json.get('protective_measures', 'Not specified')}
+
+**🎯 Long-term Recommendation:** {analysis_json.get('long_term_recommendation', 'Not specified')}
+"""
         
         return analysis_text, previous_context
         
@@ -2427,10 +2581,17 @@ def process_symptom_input(symptoms_text):
     symptom_record = save_symptoms(profile['id'], symptoms_text)
     print(f"💾 DEBUG: Saved symptoms record: {bool(symptom_record)}")
     
-    # ✅ Get CURRENT sequence number (but don't increment it)
-    current_sequence = get_sequence_number_for_cycle(profile['id'], 1) - 1  # Get current without incrementing
+    # ✅ NEW: Get CURRENT sequence number and increment it
+    current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
+    current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
     
-    # ✅ Prepare structured data for symptoms-only input
+    # ✅ NEW: Save the symptom input to insight_sequence
+    success, saved_cycle, saved_sequence = save_insight_sequence(
+        profile['id'], None, current_sequence, "symptom_input"
+    )
+    print(f"💾 DEBUG: Saved sequence: Cycle {saved_cycle}, Sequence {saved_sequence}")
+    
+    # ✅ Prepare structured data for symptoms input
     structured_data = {
         'symptoms': symptoms_text,
         'reports': "None",
@@ -2442,16 +2603,15 @@ def process_symptom_input(symptoms_text):
         'risk': "Based on symptom severity", 
         'suggested_action': "Continue monitoring",
         'input_type': 'symptoms_only',
-        'is_context_only': True  # ✅ Mark as context-only (not part of sequence)
+        'is_context_only': False  # ✅ Now it's part of the sequence
     }
     
-    # ✅ Save symptoms to structured_insights with special sequence number
-    # Use negative sequence number to indicate it's context-only
+    # ✅ Save symptoms to structured_insights with the new sequence number
     save_structured_insight(
-        profile['id'], None, -current_sequence, structured_data  # Negative to indicate context-only
+        profile['id'], None, saved_sequence, structured_data
     )
     
-    # Save the primary insight (but NOT to insight_sequence table)
+    # Save the primary insight
     if analysis:
         saved_insight = save_insight(profile['id'], None, analysis)
         print(f"💾 DEBUG: Saved insight: {bool(saved_insight)}")
@@ -2470,6 +2630,7 @@ def process_symptom_input(symptoms_text):
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_more_input"
     print(f"✅ DEBUG: Symptom processing completed for {profile['name']}")
+
 
 def handle_add_to_timeline():
     """Handle adding symptoms to timeline - ask who it's for"""
@@ -4163,4 +4324,3 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
-
