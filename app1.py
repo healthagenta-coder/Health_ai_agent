@@ -918,14 +918,13 @@ CURRENT MEDICAL REPORT (Primary Source of Truth):
 ANALYSIS GUIDELINES:
 - Prioritize medical report findings (lab results, imaging, clinical notes, assessments).
 - Distinguish between **new findings** and **previously reported or persistent issues**.
-- Indicate whether previously observed symptoms have improved, worsened, or resolved.
 - Keep the output medically structured and concise.
 
 Return ONLY valid JSON in the following format:s
 
 {{
   "new_findings": "List new lab or clinical findings in the report not seen before",
-  "change_since_last": "Describe how the current condition compares to the previous report — clearly state Improving, Worsening, or Stable and note persistence or resolution of prior symptoms",
+  "change_since_last": "Describe how the current condition compares to the previous report — clearly state Improving, Worsening, or Stable and note persistence",
   "updated_diagnosis": "Current clinical impression integrating both the new report findings and symptom trajectory",
   "clinical_implications": "Explain what these patterns indicate about the patient’s health status or disease course",
   "recommended_next_step": "Specific recommended next steps (e.g., further tests, specialist consult, treatment change)"
@@ -4164,3 +4163,4 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
