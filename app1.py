@@ -77,6 +77,7 @@ def init_db():
                 
                 # Create insight_sequence table to track report sequence
 # Replace the insight_sequence table in init_db()
+                # Create insight_sequence table to track report sequence
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS insight_sequence (
                         id SERIAL PRIMARY KEY,
@@ -85,8 +86,7 @@ def init_db():
                         sequence_number INTEGER NOT NULL,
                         insight_type VARCHAR(20) NOT NULL,
                         cycle_number INTEGER DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(member_id, report_id, cycle_number)
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
 
@@ -364,7 +364,13 @@ def get_insight_sequence_count(member_id):
         return 0
 
 def save_insight_sequence(member_id, report_id, sequence_number, insight_type):
-    """Save insight sequence information with cycle management - handle NULL report_id"""
+    """Save insight sequence information with cycle management - FIXED FOR SYMPTOMS"""
+    print(f"💾 DEBUG: save_insight_sequence CALLED with:")
+    print(f"   - member_id: {member_id}")
+    print(f"   - report_id: {report_id}")
+    print(f"   - sequence_number: {sequence_number}")
+    print(f"   - insight_type: {insight_type}")
+    
     try:
         # Get current cycle info
         current_cycle, days_in_cycle = get_current_cycle_info(member_id)
@@ -372,36 +378,38 @@ def save_insight_sequence(member_id, report_id, sequence_number, insight_type):
         # Check if we need to start a new cycle
         if should_start_new_cycle(member_id):
             new_cycle = current_cycle + 1
-            # Reset sequence to 1 for new cycle
             actual_sequence = 1
             print(f"🔄 Starting new cycle #{new_cycle}")
         else:
             new_cycle = current_cycle
-            # Use the provided sequence number for current cycle
             actual_sequence = sequence_number
             print(f"📊 Continuing cycle #{new_cycle}, sequence #{actual_sequence}")
         
         with conn.cursor() as cur:
-            # ✅ UPDATED: Handle NULL report_id for symptom-only entries
+            # ✅ Handle both report and symptom entries
             if report_id:
+                print(f"💾 DEBUG: Inserting REPORT entry...")
                 cur.execute("""
                     INSERT INTO insight_sequence (member_id, report_id, sequence_number, insight_type, cycle_number)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (member_id, report_id, actual_sequence, insight_type, new_cycle))
             else:
+                print(f"💾 DEBUG: Inserting SYMPTOM entry (no report_id)...")
                 cur.execute("""
                     INSERT INTO insight_sequence (member_id, sequence_number, insight_type, cycle_number)
                     VALUES (%s, %s, %s, %s)
                 """, (member_id, actual_sequence, insight_type, new_cycle))
                 
             conn.commit()
-            print(f"✅ Saved: Member {member_id}, Cycle {new_cycle}, Sequence {actual_sequence}, Type: {insight_type}")
+            print(f"✅ SUCCESS: Saved to insight_sequence - Member {member_id}, Cycle {new_cycle}, Sequence {actual_sequence}, Type: {insight_type}")
             return True, new_cycle, actual_sequence
     except Exception as e:
         st.error(f"Error saving insight sequence: {e}")
-        print(f"Detailed error: {e}")
+        print(f"❌ ERROR in save_insight_sequence: {e}")
+        # Try to get more specific error info
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return False, 1, 1
-
 # all helper function for the Strutured data mang
 
 def safe_json_parse(data, default=None):
@@ -548,7 +556,7 @@ def get_previous_structured_insights_with_context(member_id, current_sequence):
         return []
 
 def get_structured_context_for_gemini(member_id, current_sequence):
-    """Get formatted context from previous reports AND symptom entries for sequential analysis - IMPROVED SYMPTOM TRACKING"""
+    """Get formatted context from previous reports AND symptom entries for sequential analysis"""
     previous_insights = get_previous_structured_insights_with_context(member_id, current_sequence)
     
     if not previous_insights:
@@ -556,45 +564,31 @@ def get_structured_context_for_gemini(member_id, current_sequence):
     
     context = "PREVIOUS HEALTH TIMELINE:\n\n"
     
-    # Get clear symptom progression
-    symptom_timeline = get_symptom_progression_history(member_id)
-    
-    if symptom_timeline:
-        context += "SYMPTOM PROGRESSION HISTORY (Oldest to Newest):\n"
-        context += "═" * 50 + "\n"
-        for i, record in enumerate(symptom_timeline):
-            context += f"📅 {record['date']}: {record['symptoms']}\n"
-        context += "\n"
-    
-    # Sort by actual sequence number
+    # Sort by actual sequence number (absolute value for symptoms)
     sorted_insights = sorted(previous_insights, 
-                           key=lambda x: abs(x['sequence_number']) if x['entry_type'] == 'symptom_context' else x['sequence_number'])
-    
-    context += "DETAILED HEALTH RECORDS:\n"
-    context += "═" * 50 + "\n"
+                           key=lambda x: abs(x['sequence_number']))
     
     for insight in sorted_insights:
         data = safe_json_parse(insight['insight_data'])
-        entry_type = insight['entry_type']
+        seq_num = insight['sequence_number']
         
-        if entry_type == 'report':
-            context += f"📄 Report #{insight['sequence_number']} ({insight['created_at'].strftime('%Y-%m-%d')}):\n"
+        if seq_num < 0:
+            # This was a symptom entry
+            context += f"🤒 Symptom Entry (Sequence #{abs(seq_num)}):\n"
         else:
-            context += f"🤒 Symptom Entry ({insight['created_at'].strftime('%Y-%m-%d')}):\n"
+            # This was a report entry
+            context += f"📄 Report #{seq_num}:\n"
             
         context += f"- Symptoms: {data.get('symptoms', 'None recorded')}\n"
         
-        if data.get('lab_summary'):
-            context += f"- Lab Results: {data['lab_summary']}\n"
-        
-        if entry_type == 'report':
-            context += f"- Key Findings: {data.get('reports', 'None uploaded')}\n"
+        if data.get('reports') and data['reports'] != "None":
+            context += f"- Key Findings: {data['reports']}\n"
             
-        context += f"- Assessment: {data.get('diagnosis', 'Not specified')}\n"
-        context += f"- Recommendations: {data.get('next_steps', 'Not specified')}\n"
-        
-        if data.get('health_score'):
-            context += f"- Health Score: {data['health_score']}\n"
+        if data.get('diagnosis') and data['diagnosis'] != "Symptom analysis only":
+            context += f"- Assessment: {data['diagnosis']}\n"
+            
+        if data.get('next_steps'):
+            context += f"- Recommendations: {data['next_steps']}\n"
         
         context += "\n"
     
@@ -748,6 +742,24 @@ def extract_predictive_data(insight_json):
     
     return predictive_data
 
+def check_previous_insights_exist(member_id):
+    """Check if previous insights exist for a member - IMPROVED"""
+    try:
+        with conn.cursor() as cur:
+            # Check for any previous entries in insight_sequence (including symptoms)
+            cur.execute("""
+                SELECT COUNT(*) as count 
+                FROM insight_sequence 
+                WHERE member_id = %s
+            """, (member_id,))
+            result = cur.fetchone()
+            count = result['count'] if result else 0
+            print(f"🔍 DEBUG: Found {count} previous entries in insight_sequence for member {member_id}")
+            return count > 0
+    except Exception as e:
+        print(f"Error checking previous insights: {e}")
+        return False
+
 def get_gemini_report_insight(report_text, symptoms_text, member_data=None, region=None, member_id=None, report_id=None):
     """Get medical report analysis with structured data storage and sequential context"""
     print(f"🔍 DEBUG: Starting Gemini insight generation for member {member_id}, report {report_id}")
@@ -762,13 +774,27 @@ def get_gemini_report_insight(report_text, symptoms_text, member_data=None, regi
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
-        # Get current cycle info FIRST
+        # ✅ IMPROVED: Check for ANY previous entries (symptoms or reports)
+        has_previous_entries = check_previous_insights_exist(member_id)
+        print(f"📊 DEBUG: Previous entries exist: {has_previous_entries}")
+        
+        # Get current cycle info
         current_cycle, days_in_cycle = get_current_cycle_info(member_id)
         print(f"📊 DEBUG: Current cycle: {current_cycle}, days in cycle: {days_in_cycle}")
         
-        # Get the CURRENT sequence number for this cycle (before saving new report)
+        # Get the CURRENT sequence number for this cycle
         current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
         print(f"📊 DEBUG: Current sequence for member {member_id}, cycle {current_cycle}: {current_sequence}")
+        
+        # ✅ IMPROVED: Determine if this should be sequential based on ANY previous entries
+        if has_previous_entries:
+            print(f"🔄 DEBUG: Previous entries found, using sequential analysis")
+            # Use the actual next sequence number
+            actual_sequence = current_sequence
+        else:
+            print(f"🆕 DEBUG: No previous entries, using primary analysis")
+            # First entry, ensure sequence starts at 1
+            actual_sequence = 1
         
         # Get lab data from the report
         labs_data = {"labs": []}
@@ -1992,7 +2018,8 @@ def handle_input_type_selection(input_type):
             st.session_state.bot_state = "awaiting_profile_selection"
 
 def process_new_user_symptom_input(symptoms_text):
-    """Process symptoms for new users (before profile creation)"""
+    """Process symptoms for new users (before profile creation) - FIXED VERSION"""
+    print(f"🔍 DEBUG: Processing new user symptom input: {symptoms_text}")
     add_message("user", symptoms_text)
     
     # Store the symptoms for later profile creation
@@ -2005,7 +2032,7 @@ def process_new_user_symptom_input(symptoms_text):
             member_age=None,
             member_sex=None,
             region=None,
-            member_id=None
+            member_id=None  # This is None for new users
         )
     
     # Store the primary insight
@@ -2028,6 +2055,7 @@ def process_new_user_symptom_input(symptoms_text):
     
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_post_insight_profile"
+
 def handle_new_user_report_symptoms(symptoms_text):
     """Handle symptoms for new user report - but now we'll process directly"""
     # For new users, we'll still ask about symptoms but process immediately
@@ -2262,7 +2290,7 @@ Do not mention the Patient name
             return "🔍 Insight: Routine checkup report stored successfully."
 
 def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence_number, member_info=None, previous_reports_context=""):
-    """Get medical report analysis for new users with proper sequencing for Both option"""
+    """Get medical report analysis for new users with proper sequencing for Both option - FIXED VERSION"""
     if not GEMINI_AVAILABLE:
         if symptoms_text.lower() != "no symptoms reported - routine checkup":
             return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Manual review recommended."
@@ -2272,18 +2300,12 @@ def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
-        # Determine insight type based on sequence number
-        if sequence_number == 1:
-            insight_type = "primary"
-        elif sequence_number in [2, 3]:
-            insight_type = "sequential"
-        else:
-            insight_type = "predictive"
+        # Always use primary insight for new users (first entry)
+        insight_type = "primary"
         
         print(f"🎯 New User Both - Sequence {sequence_number}, Type: {insight_type}")
         
-        if insight_type == "primary":
-            prompt = f"""
+        prompt = f"""
 You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
 Since no previous records are available, your analysis must rely entirely on **the current report** and **presenting symptoms**.
 
@@ -2315,78 +2337,76 @@ Return ONLY valid JSON in the following format:
   "probable_diagnosis": "Most likely medical condition or clinical impression based on findings and symptoms",
   "next_step": "Specific, actionable next step (e.g., test, referral, treatment, or follow-up) relevant to the finding"
 }}
-
-"""
-        
-        elif insight_type == "sequential":
-            prompt = f"""
-Analyze this medical report in sequence and provide a **structured sequential insight**.
-
-Context:
-This is report #{sequence_number} in the patient's medical timeline.
-Patient Details: {member_info if member_info else 'Not specified'}
-Reported Symptoms: {symptoms_text}
-Summary of Previous Reports: {previous_reports_context}
-
-Current Medical Report:
-{report_text}
-
-Your task is to interpret this as a follow-up report.
-
-Provide the output in **exactly the following structured format** (no extra text or explanations):
-
-1. **New Findings:** Clearly list new abnormalities, lab deviations, or clinical notes
-2. **Progress Assessment:** Compare with expected progression — specify if the condition is *Improving*, *Worsening*, or *Stable*
-3. **Clinical Implications:** Summarize what the current findings suggest medically
-4. **Recommended Next Step:** Suggest a focused next action
-
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
-"""
-        
-        else:  # predictive insight
-            prompt = f"""
-Analyze this medical report with PREDICTIVE capabilities and provide a **comprehensive structured insight**.
-
-Context:
-This is report #{sequence_number} in the patient's timeline.
-Patient Details: {member_info if member_info else 'Not specified'}
-Reported Symptoms: {symptoms_text}
-Summary of Previous Reports: {previous_reports_context}
-
-Current Medical Report:
-{report_text}
-
-Provide the insight in the following structured format:
-
-1. Trend - How symptoms, signs, or scores are evolving over time
-2. Risk prediction - Likely progression, complications, or deterioration
-3. Suggested action - Preventive measures or immediate next steps
-4. Health score trend - Predicted risk level or score trajectory
-5. Timeline reference - Relevant dates for the observed trends and predictions
-
-Return ONLY the insight text. Do not include any additional explanations, analysis summaries, or meta-commentary about the format.
 """
         
         response = model.generate_content(prompt)
-        insight_text = response.text.strip()
+        response_text = response.text.strip()
+        print(f"🤖 DEBUG: Gemini raw response: {response_text}")
         
-        # Clean up the response
-        if "Here's" in insight_text and "analysis" in insight_text.lower():
-            lines = insight_text.split('\n')
-            for i, line in enumerate(lines):
-                if re.match(r'^\d+\.\s+[A-Za-z]', line) or 'Trend:' in line or 'Key finding:' in line:
-                    insight_text = '\n'.join(lines[i:])
-                    break
+        # IMPROVED JSON CLEANING
+        cleaned_response = response_text
+        
+        # Remove markdown code blocks
+        if '```json' in cleaned_response:
+            cleaned_response = cleaned_response.split('```json')[1].split('```')[0].strip()
+        elif '```' in cleaned_response:
+            cleaned_response = cleaned_response.split('```')[1].split('```')[0].strip()
+        
+        # Remove any text before the first {
+        if '{' in cleaned_response:
+            cleaned_response = cleaned_response[cleaned_response.index('{'):]
+        
+        # Remove any text after the last }
+        if '}' in cleaned_response:
+            cleaned_response = cleaned_response[:cleaned_response.rindex('}')+1]
+        
+        print(f"🤖 DEBUG: Cleaned response: {cleaned_response}")
+        
+        try:
+            insight_json = json.loads(cleaned_response)
+            print(f"✅ DEBUG: Successfully parsed JSON response")
+            
+            # FORMAT THE INSIGHT FOR DISPLAY
+            insight_text = f"""
+## 🔍 Primary Insight (First Report)
+
+**📊 Key Finding:** {insight_json.get('key_finding', 'Not specified')}
+
+**🩺 Probable Diagnosis:** {insight_json.get('probable_diagnosis', 'Not specified')}
+
+**🚨 Next Step:** {insight_json.get('next_step', 'Not specified')}
+"""
+            
+        except json.JSONDecodeError as e:
+            print(f"❌ DEBUG: JSON parsing failed: {e}")
+            # Fallback if JSON parsing fails
+            insight_text = f"""
+## 🔍 Primary Insight (First Report)
+
+**Based on both report and symptoms:**
+
+{response_text}
+
+*Note: This is the initial analysis of your medical report and symptoms.*
+"""
         
         return insight_text
         
     except Exception as e:
         st.error(f"Gemini AI error: {e}")
+        import traceback
+        print(f"❌ DEBUG: Full traceback: {traceback.format_exc()}")
         
-        if symptoms_text.lower() != "no symptoms reported - routine checkup":
-            return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Analysis completed."
-        else:
-            return "🔍 Insight: Routine checkup report stored successfully."
+        # Simple fallback
+        return f"""
+## 🔍 Primary Insight (First Report)
+
+**Based on both report and symptoms:**
+
+Report analysis completed. Symptoms: {symptoms_text}
+
+*Note: This is the initial analysis of your medical report and symptoms.*
+"""
 
 def handle_symptoms_for_both_report(symptoms_text):
     """Handle symptoms input when user selected 'Both' (report already uploaded)"""
@@ -2496,7 +2516,7 @@ def should_start_new_cycle(member_id):
         return False
 
 def get_sequence_number_for_cycle(member_id, cycle_number):
-    """Get the next sequence number for a specific cycle - FIXED VERSION"""
+    """Get the next sequence number for a specific cycle"""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -2560,6 +2580,17 @@ def handle_report_upload():
 
 def process_symptom_input(symptoms_text):
     """Process symptom input and generate primary insight - FIXED VERSION"""
+    print(f"🚨 DEBUG: process_symptom_input CALLED with: {symptoms_text}")
+    print(f"🚨 DEBUG: Current bot_state: {st.session_state.bot_state}")
+    print(f"🚨 DEBUG: temp_profile exists: {hasattr(st.session_state, 'temp_profile')}")
+    
+    if hasattr(st.session_state, 'temp_profile'):
+        profile = st.session_state.temp_profile
+        print(f"🚨 DEBUG: Processing for profile: {profile['name']} (ID: {profile['id']})")
+    else:
+        print(f"❌ DEBUG: NO TEMP PROFILE FOUND!")
+        return
+    
     add_message("user", symptoms_text)
     
     profile = st.session_state.temp_profile
@@ -2567,7 +2598,14 @@ def process_symptom_input(symptoms_text):
     
     print(f"🔍 DEBUG: Processing symptoms for {profile['name']}: {symptoms_text}")
     
+    # ✅ CRITICAL: Get sequence info BEFORE generating insight
+    current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
+    current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
+    
+    print(f"📊 DEBUG: Member {profile['id']}, Cycle {current_cycle}, Sequence {current_sequence}")
+    
     # Generate primary insight
+    print(f"🤖 DEBUG: Calling get_gemini_symptom_analysis...")
     with st.spinner("Analyzing symptoms..."):
         analysis, previous_context = get_gemini_symptom_analysis(
             symptoms_text, 
@@ -2576,20 +2614,26 @@ def process_symptom_input(symptoms_text):
             region=region,
             member_id=profile['id']
         )
+    print(f"🤖 DEBUG: Gemini analysis completed: {len(analysis) if analysis else 0} chars")
     
     # Save symptoms
+    print(f"💾 DEBUG: Saving symptoms to database...")
     symptom_record = save_symptoms(profile['id'], symptoms_text)
     print(f"💾 DEBUG: Saved symptoms record: {bool(symptom_record)}")
     
-    # ✅ NEW: Get CURRENT sequence number and increment it
-    current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
-    current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
-    
-    # ✅ NEW: Save the symptom input to insight_sequence
+    # ✅ CRITICAL FIX: Save the symptom input to insight_sequence
+    print(f"💾 DEBUG: Attempting to save to insight_sequence...")
     success, saved_cycle, saved_sequence = save_insight_sequence(
-        profile['id'], None, current_sequence, "symptom_input"
+        profile['id'], 
+        None,  # No report_id for symptom-only entries
+        current_sequence, 
+        "symptom_primary"
     )
-    print(f"💾 DEBUG: Saved sequence: Cycle {saved_cycle}, Sequence {saved_sequence}")
+    
+    if success:
+        print(f"✅ SUCCESS: Saved to insight_sequence - Cycle {saved_cycle}, Sequence {saved_sequence}")
+    else:
+        print(f"❌ FAILED: Could not save to insight_sequence")
     
     # ✅ Prepare structured data for symptoms input
     structured_data = {
@@ -2603,16 +2647,19 @@ def process_symptom_input(symptoms_text):
         'risk': "Based on symptom severity", 
         'suggested_action': "Continue monitoring",
         'input_type': 'symptoms_only',
-        'is_context_only': False  # ✅ Now it's part of the sequence
+        'is_context_only': False
     }
     
-    # ✅ Save symptoms to structured_insights with the new sequence number
-    save_structured_insight(
+    # ✅ Save symptoms to structured_insights
+    print(f"💾 DEBUG: Saving to structured_insights...")
+    structured_result = save_structured_insight(
         profile['id'], None, saved_sequence, structured_data
     )
+    print(f"💾 DEBUG: Saved structured insight: {bool(structured_result)}")
     
     # Save the primary insight
     if analysis:
+        print(f"💾 DEBUG: Saving to insight_history...")
         saved_insight = save_insight(profile['id'], None, analysis)
         print(f"💾 DEBUG: Saved insight: {bool(saved_insight)}")
     
@@ -2629,8 +2676,7 @@ def process_symptom_input(symptoms_text):
     
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_more_input"
-    print(f"✅ DEBUG: Symptom processing completed for {profile['name']}")
-
+    print(f"✅ DEBUG: Symptom processing COMPLETED for {profile['name']}")
 
 def handle_add_to_timeline():
     """Handle adding symptoms to timeline - ask who it's for"""
@@ -3482,7 +3528,7 @@ def handle_chat_button(button_text):
                 break
 
 def handle_new_user_name_age_input(name_age_text):
-    """Handle name/age input for new users after primary insight - SAVE TO STRUCTURED_INSIGHTS"""
+    """Handle name/age input for new users after primary insight - FIXED VERSION"""
     add_message("user", name_age_text)
     
     # Parse name, age, and gender
@@ -3496,15 +3542,55 @@ def handle_new_user_name_age_input(name_age_text):
         if new_member:
             st.session_state.current_profiles.append(new_member)
             
+            print(f"✅ DEBUG: Created new member {name} with ID: {new_member['id']}")
+            
             # Now save the stored input data to the new profile
             input_type = st.session_state.new_user_input_type
             input_data = st.session_state.new_user_input_data
             
             if input_type == "🤒 Check Symptoms":
-                # Save symptoms
+                # ✅ CRITICAL FIX: Save symptoms to database with the new member_id
+                print(f"💾 DEBUG: Saving symptoms for new member {new_member['id']}")
                 save_symptoms(new_member['id'], input_data)
+                
+                # ✅ CRITICAL FIX: Save to insight_sequence for the new member
+                current_sequence = get_sequence_number_for_cycle(new_member['id'], 1)
+                success, saved_cycle, saved_sequence = save_insight_sequence(
+                    new_member['id'], 
+                    None,  # No report_id for symptoms
+                    current_sequence, 
+                    "symptom_primary"
+                )
+                
+                if success:
+                    print(f"✅ SUCCESS: Saved symptom to insight_sequence - Member {new_member['id']}, Sequence {saved_sequence}")
+                
+                # ✅ CRITICAL FIX: Save to structured_insights
+                structured_data = {
+                    'symptoms': input_data,
+                    'reports': "None",
+                    'diagnosis': "Symptom analysis only", 
+                    'next_steps': "Monitor symptoms and consult if needed",
+                    'health_score': 80,
+                    'predictive_data': {},
+                    'trend': "Symptom monitoring",
+                    'risk': "Based on symptom severity", 
+                    'suggested_action': "Continue monitoring",
+                    'input_type': 'symptoms_only',
+                    'is_context_only': False
+                }
+                
+                save_structured_insight(
+                    new_member['id'], 
+                    None, 
+                    saved_sequence, 
+                    structured_data
+                )
+                print(f"✅ DEBUG: Saved structured insight for symptoms")
+                
                 # Save the insight
                 save_insight(new_member['id'], None, st.session_state.new_user_primary_insight)
+                print(f"✅ DEBUG: Saved insight history")
                 
             elif input_type == "📄 Upload Report" or input_type == "Both":
                 # For Both and Report, save report and symptoms
@@ -3624,11 +3710,12 @@ def handle_user_input(user_input):
     print(f"🔍 DEBUG: Input: {user_input}")
     
     if st.session_state.bot_state == "awaiting_symptom_input":
-        print("🔍 DEBUG: Processing symptom input")
+        print("🔍 DEBUG: Processing symptom input - CALLING process_symptom_input")
         process_symptom_input(user_input)
     
     elif st.session_state.bot_state == "awaiting_symptom_input_new_user":
         print("🔍 DEBUG: Processing new user symptom input")
+        process_new_user_symptom_input(user_input)
         process_new_user_symptom_input(user_input)
     
     elif st.session_state.bot_state == "awaiting_name_age":
@@ -3661,8 +3748,8 @@ def handle_user_input(user_input):
             handle_input_type_selection("📄 Upload Report")
         elif user_input.lower() in ["both", "symptoms and report"]:
             handle_input_type_selection("Both")
-        else:
-            add_message("assistant", "Please choose one of the options above or type: 'Symptoms', 'Report', or 'Both'")
+        # else:
+        #     add_message("assistant", "Please choose one of the options above or type: 'Symptoms', 'Report', or 'Both'")
     
     elif st.session_state.bot_state == "awaiting_profile_selection":
         add_message("user", user_input)
