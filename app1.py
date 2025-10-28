@@ -320,7 +320,7 @@ def clean_text_for_comparison(text):
     if not text:
         return ""
     text = text.lower()
-    text = re.sub(r'\s+', ' ', text)  
+    text = re.sub(r'\s+', ' ', text) 
     text = text.strip()
     return text
 
@@ -430,16 +430,60 @@ def safe_json_parse(data, default=None):
         return default
 
 def save_structured_insight(member_id, report_id, sequence_number, insight_data, labs_data=None):
-    """Save structured insight data to database as JSONB with lab data - ENSURES PROPER JSON"""
+    """
+    Save structured insight data to database as JSONB.
+    NEW BEHAVIOR: Duplicates previous insight and updates with new values to retain context.
+    """
     try:
-        # Add lab data to insight_data if provided
+        # Step 1: Fetch the previous insight for this member
+        previous_insight = None
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT insight_data
+                FROM structured_insights 
+                WHERE member_id = %s
+                ORDER BY sequence_number DESC 
+                LIMIT 1
+            """, (member_id,))
+            result = cur.fetchone()
+            if result:
+                previous_insight = safe_json_parse(result['insight_data'])
+        
+        # Step 2: Create new insight by duplicating previous (if exists) and updating values
+        if previous_insight:
+            # Start with previous insight as base
+            new_insight_data = previous_insight.copy()
+            
+            # Archive previous data with "_prev" suffix
+            new_insight_data['previous_symptoms'] = new_insight_data.get('symptoms', 'None')
+            new_insight_data['previous_reports'] = new_insight_data.get('reports', 'None')
+            new_insight_data['previous_diagnosis'] = new_insight_data.get('diagnosis', 'Not specified')
+            new_insight_data['previous_next_steps'] = new_insight_data.get('next_steps', 'Not specified')
+            new_insight_data['previous_health_score'] = new_insight_data.get('health_score', 0)
+            new_insight_data['previous_trend'] = new_insight_data.get('trend', 'Unknown')
+            new_insight_data['previous_risk'] = new_insight_data.get('risk', 'Not assessed')
+            new_insight_data['previous_lab_summary'] = new_insight_data.get('lab_summary', 'None')
+            
+            # Update with new values
+            new_insight_data.update(insight_data)
+            
+            # Track that this is an updated entry
+            new_insight_data['is_updated_entry'] = True
+            new_insight_data['update_timestamp'] = datetime.now().isoformat()
+        else:
+            # First entry for this member, no previous data to archive
+            new_insight_data = insight_data.copy()
+            new_insight_data['is_updated_entry'] = False
+        
+        # Step 3: Add lab data if provided
         if labs_data and 'labs' in labs_data and labs_data['labs']:
-            insight_data['lab_results'] = labs_data['labs']
-            insight_data['lab_summary'] = extract_lab_summary(labs_data)
+            new_insight_data['lab_results'] = labs_data['labs']
+            new_insight_data['lab_summary'] = extract_lab_summary(labs_data)
         
-        # ✅ Ensure we're storing proper JSON string
-        insight_data_json = json.dumps(insight_data)
+        # Step 4: Ensure proper JSON serialization
+        insight_data_json = json.dumps(new_insight_data)
         
+        # Step 5: Insert the new insight entry
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO structured_insights 
@@ -450,16 +494,20 @@ def save_structured_insight(member_id, report_id, sequence_number, insight_data,
                 member_id,
                 report_id,
                 sequence_number,
-                insight_data_json  # Now it's definitely a JSON string
+                insight_data_json
             ))
             conn.commit()
             result = cur.fetchone()
             print(f"💾 Saved structured insight: Member {member_id}, Sequence {sequence_number}")
+            if previous_insight:
+                print(f"   └─ Duplicated and updated from previous sequence")
             return result
+            
     except Exception as e:
         st.error(f"Error saving structured insight: {e}")
         print(f"Detailed error: {e}")
         return None
+
 
 def extract_lab_summary(labs_data):
     """Extract a concise summary of lab results"""
@@ -479,8 +527,36 @@ def extract_lab_summary(labs_data):
     
     return "; ".join(summary_parts) if summary_parts else "All labs normal"
 
+
+def format_insight_for_comparison(insight_data):
+    """
+    Helper function to format insight data for displaying changes/progression.
+    Highlights the difference between current and previous values.
+    """
+    comparison = {
+        'current': {
+            'symptoms': insight_data.get('symptoms', 'None'),
+            'reports': insight_data.get('reports', 'None'),
+            'diagnosis': insight_data.get('diagnosis', 'Not specified'),
+            'health_score': insight_data.get('health_score', 0),
+            'trend': insight_data.get('trend', 'Unknown'),
+        },
+        'previous': {
+            'symptoms': insight_data.get('previous_symptoms', 'None'),
+            'reports': insight_data.get('previous_reports', 'None'),
+            'diagnosis': insight_data.get('previous_diagnosis', 'Not specified'),
+            'health_score': insight_data.get('previous_health_score', 0),
+            'trend': insight_data.get('previous_trend', 'Unknown'),
+        }
+    }
+    return comparison
+
+
 def get_previous_structured_insights(member_id, limit=3):
-    """Get previous structured insights for sequential context - FIXED JSON PARSING"""
+    """
+    Get previous structured insights for sequential context - with proper JSON parsing.
+    Now also returns archived "_prev" fields for comparison.
+    """
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -492,7 +568,7 @@ def get_previous_structured_insights(member_id, limit=3):
             """, (member_id, limit))
             insights = cur.fetchall()
             
-            # ✅ FIX: Proper JSON parsing
+            # Proper JSON parsing
             for insight in insights:
                 if insight['insight_data'] and isinstance(insight['insight_data'], str):
                     try:
@@ -595,16 +671,21 @@ def get_structured_context_for_gemini(member_id, current_sequence):
     return context
 
 def get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, limit=3):
-    """Simplified version that only uses structured insights data"""
+    """Fetch previous structured insights with medical report_date for temporal correlation."""
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT si.insight_data, si.sequence_number, si.created_at
+                SELECT 
+                    si.insight_data, 
+                    si.sequence_number,
+                    mr.report_date,
+                    mr.report_date AS created_at
                 FROM structured_insights si
-                WHERE si.member_id = %s 
+                LEFT JOIN medical_reports mr ON si.report_id = mr.id
+                WHERE si.member_id = %s
                 AND si.sequence_number > 0
                 AND si.sequence_number < %s
-                ORDER BY si.sequence_number DESC 
+                ORDER BY si.sequence_number DESC
                 LIMIT %s
             """, (member_id, current_sequence, limit))
             
@@ -622,10 +703,11 @@ def get_previous_reports_for_sequence(member_id, current_sequence, current_cycle
             
             print(f"🔍 DEBUG: Found {len(insights)} previous structured insights for member {member_id}, sequence {current_sequence}")
             return insights
-            
+
     except Exception as e:
         print(f"❌ Error fetching previous structured insights: {e}")
         return []
+
 
 def get_previous_insights(member_id, limit=3):
     """Get previous insights for sequential analysis"""
@@ -801,7 +883,7 @@ def get_gemini_report_insight(report_text, symptoms_text, member_data=None, regi
         lab_score = 15
         if report_text and GEMINI_AVAILABLE:
             print("🔬 DEBUG: Getting lab data from Gemini...")
-            labs_data, lab_score = get_health_score_from_gemini(report_text, {})
+            labs_data, lab_score, extracted_report_date = get_health_score_from_gemini(report_text, {})
             print(f"🔬 DEBUG: Extracted {len(labs_data.get('labs', []))} lab tests")
         
         # Get previous reports for sequential context
@@ -925,38 +1007,77 @@ Return ONLY valid JSON in the following format:
 """
         
         elif insight_type == "sequential":
+    # Build temporal context with actual dates
+            previous_reports_context = ""
+            if current_sequence > 1 and member_id:
+                previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, 2)
+                if previous_reports:
+                    previous_reports_context = "PREVIOUS REPORTS WITH DATES:\n"
+                    for prev_report in previous_reports:
+                        report_date = prev_report['report_date'] or prev_report['created_at']
+                        date_str = report_date.strftime('%Y-%m-%d') if hasattr(report_date, 'strftime') else str(report_date)
+                        
+                        if prev_report.get('report_text'):
+                            prev_text = prev_report['report_text'][:300] + "..." if len(prev_report['report_text']) > 300 else prev_report['report_text']
+                        else:
+                            insight_data = prev_report['insight_data']
+                            prev_text = f"Symptoms: {insight_data.get('symptoms', 'None')}, Findings: {insight_data.get('reports', 'None')}, Diagnosis: {insight_data.get('diagnosis', 'None')}"
+                        
+                        previous_reports_context += f"\nReport #{prev_report['sequence_number']} (Date: {date_str}):\n{prev_text}\n"
+            
+            # Determine current report date
+            current_report_date = datetime.now().date()
+            if extracted_report_date:
+                try:
+                    if isinstance(extracted_report_date, str):
+                        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'):
+                            try:
+                                current_report_date = datetime.strptime(extracted_report_date, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                    else:
+                        current_report_date = extracted_report_date if hasattr(extracted_report_date, 'date') else extracted_report_date
+                except:
+                    pass
+            
+            current_date_str = current_report_date.strftime('%Y-%m-%d')
+            
             prompt = f"""
-You are a medical AI assistant analyzing patient health reports over time. 
-Your goal is to extract meaningful medical insights by correlating **the current medical report findings** with **symptom evolution over previous reports**.
+        You are a medical AI assistant analyzing patient health reports over time with DATE-AWARE temporal correlation.
 
-SEQUENTIAL CONTEXT — PRIOR SYMPTOMS AND TRENDS:
-{previous_context}
+        CRITICAL: This report is dated {current_date_str}. Compare findings against previous reports with their specific dates.
 
-PATIENT INFORMATION:
-{member_info}
+        TEMPORAL CONTEXT — PREVIOUS REPORTS WITH DATES:
+        {previous_reports_context}
 
-CURRENT REPORTED SYMPTOMS:
-{symptoms_text}
+        PATIENT INFORMATION:
+        {member_info}
 
-CURRENT MEDICAL REPORT (Primary Source of Truth):
-{report_text}
+        CURRENT REPORTED SYMPTOMS (as of {current_date_str}):
+        {symptoms_text}
 
-ANALYSIS GUIDELINES:
-- Prioritize medical report findings (lab results, imaging, clinical notes, assessments).
-- Distinguish between **new findings** and **previously reported or persistent issues**.
-- Keep the output medically structured and concise.
+        CURRENT MEDICAL REPORT (Dated {current_date_str}):
+        {report_text}
 
-Return ONLY valid JSON in the following format:s
+        ANALYSIS GUIDELINES:
+        - Compare SPECIFIC findings between the dated reports
+        - Calculate approximate time elapsed between current and previous reports
+        - Note if findings are consistent with natural disease progression given the time period
+        - Identify NEW findings not present in previous reports
+        - Keep the output medically structured and concise
+        - Reference specific dates when describing changes
 
-{{
-  "new_findings": "List new lab or clinical findings in the report not seen before",
-  "change_since_last": "Describe how the current condition compares to the previous report — clearly state Improving, Worsening, or Stable and note persistence",
-  "updated_diagnosis": "Current clinical impression integrating both the new report findings and symptom trajectory",
-  "clinical_implications": "Explain what these patterns indicate about the patient’s health status or disease course",
-  "recommended_next_step": "Specific recommended next steps (e.g., further tests, specialist consult, treatment change)"
-}}
+        Return ONLY valid JSON in the following format:
 
-"""
+        {{
+        "new_findings": "List new lab or clinical findings in the {current_date_str} report not seen in previous reports",
+        "change_since_last": "Describe temporal progression - include approximate time elapsed and specify if Improving, Worsening, or Stable",
+        "updated_diagnosis": "Current clinical impression integrating temporal progression and new findings",
+        "clinical_implications": "Explain what the temporal pattern indicates about disease progression or recovery",
+        "recommended_next_step": "Specific recommended actions based on temporal trend"
+        }}
+        """
         
         else:  # predictive insight
             prompt = f"""
@@ -1181,13 +1302,13 @@ def get_symptom_progression_history(member_id):
 
 def get_health_score_from_gemini(report_text, current_profiles=None, report_data=None):
     """
-    Extract lab test results from a PDF text using Gemini model and return structured JSON.
+    Extract lab test results AND report date from a PDF text using Gemini model and return structured JSON.
     """
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         prompt = f"""
-        You are a medical data extraction specialist. Extract ALL laboratory test results from this medical report.
+        You are a medical data extraction specialist. Extract ALL laboratory test results AND the report date from this medical report.
 
         PDF TEXT:
         {report_text[:4000]}  # Limit text to avoid token limits
@@ -1197,7 +1318,8 @@ def get_health_score_from_gemini(report_text, current_profiles=None, report_data
         2. Extract: Test Name, Result Value, Reference Range, Normal Status
         3. If any field is missing, use "N/A"
         4. For Normal Status, use: "normal", "abnormal", "high", "low", or "N/A"
-        5. Return ONLY valid JSON format, no other text
+        5. Find the report date - look for dates in formats like: DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, or textual dates
+        6. Return ONLY valid JSON format, no other text
 
         REQUIRED JSON FORMAT:
         {{
@@ -1208,7 +1330,8 @@ def get_health_score_from_gemini(report_text, current_profiles=None, report_data
               "reference_range": "normal range",
               "normal_status": "normal/abnormal/high/low/N/A"
             }}
-          ]
+          ],
+          "report_date": "extracted date in YYYY-MM-DD format or null if not found"
         }}
 
         Return ONLY the JSON object. No explanations, no markdown, no additional text.
@@ -1219,29 +1342,34 @@ def get_health_score_from_gemini(report_text, current_profiles=None, report_data
         
         # Clean the response - remove markdown code blocks if present
         if '```json' in response_text:
-            response_text = response_text.split('```json')[1].split('```')[0]
+            response_text = response_text.split('```json')[1].split('```')[0].strip()
         elif '```' in response_text:
-            response_text = response_text.split('```')[1].split('```')[0]
+            response_text = response_text.split('```')[1].split('```')[0].strip()
         
         # Parse JSON
-        labs_data = json.loads(response_text)
-        print(labs_data)
+        extracted_data = json.loads(response_text)
+        
+        # Extract labs data and report date
+        labs_data = {"labs": extracted_data.get("labs", [])}
+        report_date = extracted_data.get("report_date")
+        
         # Calculate lab score
         lab_score = calculate_lab_score(labs_data)
         
         # Debug: Print extracted data
         print(f"Extracted {len(labs_data.get('labs', []))} lab tests")
+        print(f"Report date extracted: {report_date}")
         print(f"Lab score: {lab_score}/25")
         
-        return labs_data, lab_score
+        return labs_data, lab_score, report_date
 
     except json.JSONDecodeError as e:
         st.error(f"JSON parsing error: {str(e)}")
         print(f"Raw response: {response.text if 'response' in locals() else 'No response'}")
-        return {"labs": []}, 15
+        return {"labs": []}, 15, None
     except Exception as e:
         st.error(f"Error extracting lab data: {str(e)}")
-        return {"labs": []}, 15
+        return {"labs": []}, 15, None
 
 def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None, region=None, member_id=None):
     """Get symptom analysis with sequence-aware insight types - FIXED VERSION"""
@@ -1335,8 +1463,9 @@ Return ONLY valid JSON in the following format:
         # SEQUENTIAL INSIGHT - Following up on previous symptoms/reports
         elif insight_type == "sequential":
             prompt = f"""
-You are a medical AI assistant analyzing a patient's symptom progression in relation to their **previous medical diagnosis**.
-Your goal is to determine if current symptoms are **consistent with, explain, or indicate changes** in their diagnosed condition.
+You are a medical AI assistant analyzing a patient's **symptom progression** in relation to their **previous medical diagnosis**.
+
+Your goal is to determine if the current symptoms are **consistent with**, **explained by**, or **indicate a change in** their diagnosed condition.
 
 PREVIOUS MEDICAL DIAGNOSIS & FINDINGS (Reference):
 {previous_context}
@@ -1348,26 +1477,25 @@ CURRENT REPORTED SYMPTOMS:
 {symptoms_text}
 
 ANALYSIS GUIDELINES:
-- **Primary Task**: Assess if current symptoms are RESPONSIBLE FOR or EXPLAINED BY the previous medical diagnosis
-- Compare symptoms against the key findings and diagnosis from the previous report
-- Determine if symptoms indicate:
-  * Expected progression of the diagnosed condition
-  * Improvement/recovery from the condition
-  * Worsening/complication of the condition
+- Identify any **new symptoms** that were NOT mentioned in the previous diagnosis.
+- Compare current symptoms against the **key findings and diagnosis** from the previous report.
+- Determine whether symptoms indicate:
+  * Expected progression of the condition
+  * Improvement or recovery
+  * Worsening or complication
   * Resolution of the condition
-- Identify any NEW symptoms that were NOT mentioned in the previous diagnosis
-- Assess if symptoms suggest the patient is following medical recommendations
-- Recommend if additional medical evaluation or treatment adjustment is needed
+- Evaluate if symptoms suggest the patient is **adhering to medical recommendations**.
+- Provide a **clear clinical impression** of the current state.
+- Recommend next medical steps or escalation if required.
 
 Return ONLY valid JSON in the following format:
 
 {{
-  "symptoms_aligned_with_diagnosis": "YES/NO - Are current symptoms consistent with the previous diagnosis? Explain briefly.",
-  "symptom_responsibility": "Which current symptoms are explained by the previous diagnosis?",
-  "new_symptoms_noted": "Any symptoms reported now that were NOT in the previous medical report?",
-  "disease_progression": "Is the condition improving, stable, worsening, or progressing? Provide assessment.",
-  "clinical_assessment": "Overall assessment: Are symptoms following expected course or indicating complications/changes?",
-  "recommended_action": "Specific next steps (e.g., continue current treatment, seek follow-up consultation, urgent evaluation needed)"
+  "new_findings": "List new symptoms or notable changes in the current report compared to previous.",
+  "change_since_last": "Describe whether the condition is Improving, Worsening, or Stable, and note persistence of symptoms.",
+  "updated_diagnosis": "Provide the current clinical impression by integrating symptom trajectory and previous diagnosis context.",
+  "clinical_implications": "Explain what these symptom patterns indicate about the patient’s health or disease course.",
+  "recommended_next_step": "Specific recommended next steps (e.g., further tests, specialist consult, treatment change)."
 }}
 """
         
@@ -1461,17 +1589,15 @@ Return ONLY valid JSON in the following format:
             analysis_text = f"""
 ## 🔍 Sequential Symptom Analysis (Diagnosis Correlation)
 
-**✅ Symptoms Aligned with Diagnosis:** {analysis_json.get('symptoms_aligned_with_diagnosis', 'Not specified')}
+**🆕 new_findings:** {analysis_json.get('new_findings', 'Not specified')}
 
-**🔗 Symptom Responsibility:** {analysis_json.get('symptom_responsibility', 'Not specified')}
+**📈 change_since_last:** {analysis_json.get('change_since_last', 'Not specified')}
 
-**🆕 New Symptoms Noted:** {analysis_json.get('new_symptoms_noted', 'Not specified')}
+**🩺 updated_diagnosis:** {analysis_json.get('updated_diagnosis', 'Not specified')}
 
-**📈 Disease Progression:** {analysis_json.get('disease_progression', 'Not specified')}
+**🔬 clinical_implications:** {analysis_json.get('clinical_implications', 'Not specified')}
 
-**🔬 Clinical Assessment:** {analysis_json.get('clinical_assessment', 'Not specified')}
-
-**🚨 Recommended Action:** {analysis_json.get('recommended_action', 'Not specified')}
+**🚨 recommended_next_step:** {analysis_json.get('recommended_next_step', 'Not specified')}
 """
         
         else:  # predictive
@@ -1918,11 +2044,39 @@ def save_symptoms(member_id, symptoms_text, severity=None):
         return None
 
 def save_medical_report(member_id, report_text, report_date=None):
-    if report_date is None:
-        report_date = datetime.now().date()
-    
+    """Save medical report with extracted date - IMPROVED VERSION"""
     try:
         with conn.cursor() as cur:
+            # If no report_date provided, use current date as fallback
+            if report_date is None:
+                report_date = datetime.now().date()
+            else:
+                # Try to parse the date string if it's provided
+                try:
+                    if isinstance(report_date, str):
+                        # Try different date formats
+                        parsed_date = None
+                        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d'):
+                            try:
+                                parsed_date = datetime.strptime(report_date, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        
+                        # If still not parsed, use current date
+                        report_date = parsed_date if parsed_date else datetime.now().date()
+                    elif hasattr(report_date, 'date'):
+                        # It's a datetime object
+                        report_date = report_date.date()
+                    else:
+                        # Fallback to current date
+                        report_date = datetime.now().date()
+                except Exception as e:
+                    print(f"Error parsing report date: {e}")
+                    report_date = datetime.now().date()
+            
+            print(f"💾 Saving report with date: {report_date}")
+            
             cur.execute(
                 """INSERT INTO medical_reports (member_id, report_text, report_date) 
                 VALUES (%s, %s, %s) RETURNING *""",
@@ -1932,6 +2086,7 @@ def save_medical_report(member_id, report_text, report_date=None):
             return cur.fetchone()
     except Exception as e:
         st.error(f"Error saving medical report: {e}")
+        print(f"Detailed error: {e}")
         return None
 
 # # def parse_name_age(input_text):
@@ -2123,17 +2278,18 @@ def process_new_user_report(uploaded_file):
         st.session_state.bot_state = "welcome"
         return
     
-    # For new users, we can't check duplicates yet (no profile), so proceed directly
-    # Get lab data if available
+    # ✅ Extract lab data AND report date
     labs_data = {"labs": []}
+    extracted_report_date = None
     if report_text and GEMINI_AVAILABLE:
-        labs_data, _ = get_health_score_from_gemini(report_text, {})
+        labs_data, _, extracted_report_date = get_health_score_from_gemini(report_text, {})
     
     # Check if this is part of "Both" input
     if getattr(st.session_state, 'pending_both', False):
         # For "Both", store the report and immediately ask for symptoms
         st.session_state.temp_report_for_both = report_text
         st.session_state.temp_labs_data = labs_data
+        st.session_state.temp_report_date = extracted_report_date  # ✅ Store date
         
         add_message("assistant", 
                    "✅ Report uploaded successfully!\n\n"
@@ -2144,8 +2300,10 @@ def process_new_user_report(uploaded_file):
         st.session_state.new_user_input_data = {
             "report_text": report_text,
             "symptoms_text": "No symptoms reported - routine checkup",
-            "labs_data": labs_data
+            "labs_data": labs_data,
+            "report_date": extracted_report_date  # ✅ Store date
         }
+        
         
         region = st.session_state.current_family.get('region') if st.session_state.current_family else None
         
@@ -2307,37 +2465,38 @@ def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence
         
         prompt = f"""
 You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
-Since no previous records are available, your analysis must rely entirely on **the current report** and **presenting symptoms**.
+You MUST use both the **medical report findings (primary)** and the **presenting symptoms (supporting)** in your analysis.
 
-CONTEXT:
-- This is the patient's FIRST medical record.
-- No prior health history or symptom evolution data is available.
-- Emphasize objective findings from the medical report. Use reported symptoms to support or contextualize these findings, not as the primary basis.
+RULES:
+- You are REQUIRED to reference at least one relevant presenting symptom in your reasoning for the probable diagnosis.
+- If the report is clear, use symptoms to support or increase diagnostic confidence.
+- If the report is unclear or normal, rely more on symptoms to guide next steps.
+- If symptoms are irrelevant, explicitly mention that in the probable_diagnosis field.
 
 PATIENT INFORMATION:
 {member_info}
 
-PRESENTING SYMPTOMS:
+PRESENTING SYMPTOMS (MANDATORY CONTEXT):
 {symptoms_text}
 
 CURRENT MEDICAL REPORT (Primary Source of Truth):
 {report_text}
 
-ANALYSIS GUIDELINES:
-- Identify the most clinically significant finding or abnormality in the report.
-- Infer the most probable diagnosis based on objective findings and symptom context.
-- Recommend a clear and specific next step (e.g., diagnostic test, referral, monitoring, treatment initiation).
-- Avoid speculative or non-clinical language.
-- Be precise and medically structured.
+ANALYSIS STEPS (INTERNAL — do not output these steps):
+1. Extract the most significant abnormality or finding from the report.
+2. Identify symptoms that directly or indirectly support this finding.
+3. If no symptoms match the findings, note that explicitly.
+4. Generate a concise medical summary.
 
-Return ONLY valid JSON in the following format:
+OUTPUT — Return ONLY valid JSON in this format:
 
 {{
-  "key_finding": "Concise but medically meaningful summary of the most important abnormality or observation in the report",
-  "probable_diagnosis": "Most likely medical condition or clinical impression based on findings and symptoms",
-  "next_step": "Specific, actionable next step (e.g., test, referral, treatment, or follow-up) relevant to the finding"
+  "key_finding": "Concise, medically meaningful summary of the most important abnormality in the report",
+  "probable_diagnosis": "Diagnosis or clinical impression based on findings + at least one referenced symptom (if present)",
+  "next_step": "Specific, actionable next step such as diagnostic test, referral, treatment, or monitoring"
 }}
 """
+
         
         response = model.generate_content(prompt)
         response_text = response.text.strip()
@@ -2374,7 +2533,7 @@ Return ONLY valid JSON in the following format:
 
 **🩺 Probable Diagnosis:** {insight_json.get('probable_diagnosis', 'Not specified')}
 
-**🚨 Next Step:** {insight_json.get('next_step', 'Not specified')}
+**🚨 Next Stddep:** {insight_json.get('next_step', 'Not specified')}
 """
             
         except json.JSONDecodeError as e:
@@ -2620,7 +2779,7 @@ def process_symptom_input(symptoms_text):
     print(f"💾 DEBUG: Saving symptoms to database...")
     symptom_record = save_symptoms(profile['id'], symptoms_text)
     print(f"💾 DEBUG: Saved symptoms record: {bool(symptom_record)}")
-    
+                      
     # ✅ CRITICAL FIX: Save the symptom input to insight_sequence
     print(f"💾 DEBUG: Attempting to save to insight_sequence...")
     success, saved_cycle, saved_sequence = save_insight_sequence(
@@ -2868,6 +3027,9 @@ def handle_symptoms_for_both_returning(symptoms_text):
     report_text = st.session_state.temp_report_for_both_returning
     labs_data = getattr(st.session_state, 'temp_labs_data_returning', {"labs": []})
     
+    # ✅ Get the extracted report date
+    extracted_report_date = getattr(st.session_state, 'temp_report_date_returning', None)
+    
     # Process symptoms
     symptoms_lower = symptoms_text.lower()
     if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
@@ -2877,9 +3039,9 @@ def handle_symptoms_for_both_returning(symptoms_text):
         symptoms_to_store = symptoms_text
         symptom_severity = 2
     
-    # Save symptoms and report
+    # Save symptoms and report WITH extracted date
     symptom_record = save_symptoms(profile['id'], symptoms_to_store, symptom_severity)
-    report = save_medical_report(profile['id'], report_text)
+    report = save_medical_report(profile['id'], report_text, extracted_report_date)  # ✅ Pass extracted date
     
     # Update report with symptom data
     if report:
@@ -2982,16 +3144,19 @@ def process_report_directly(profile, report_text):
     symptom_severity = 1
     
     # Get lab data if available
+    # Get lab data and report date if available
     labs_data = {"labs": []}
     lab_score = 15
+    extracted_report_date = None
     if report_text and GEMINI_AVAILABLE:
-        print("🔬 Getting lab data from Gemini...")
-        labs_data, lab_score = get_health_score_from_gemini(report_text, {})
+        print("🔬 Getting lab data and report date from Gemini...")
+        labs_data, lab_score, extracted_report_date = get_health_score_from_gemini(report_text, {})
         print(f"🔬 Extracted {len(labs_data.get('labs', []))} lab tests")
-    
+        print(f"🔬 Extracted report date: {extracted_report_date}")
+        
     # Save report
     print("💾 Saving medical report...")
-    report = save_medical_report(profile['id'], report_text)
+    report = save_medical_report(profile['id'], report_text, extracted_report_date)
     
     # Update report with symptom data
     if report:
@@ -3169,6 +3334,13 @@ def process_uploaded_report(uploaded_file):
 def process_report_after_duplicate_check(profile, report_text):
     """Continue report processing after duplicate check"""
     try:
+        # ✅ ADD THIS: Extract report date BEFORE processing
+        extracted_report_date = None
+        if report_text and GEMINI_AVAILABLE:
+            labs_data, _, extracted_report_date = get_health_score_from_gemini(report_text, {})
+            # Store for later use if needed
+            st.session_state.temp_report_date = extracted_report_date
+        
         # Check if this is part of "Both" for returning users
         if getattr(st.session_state, 'pending_both_returning', False):
             # Store the report and ask for symptoms
@@ -3179,6 +3351,9 @@ def process_report_after_duplicate_check(profile, report_text):
             if report_text and GEMINI_AVAILABLE:
                 labs_data, _ = get_health_score_from_gemini(report_text, {})
             st.session_state.temp_labs_data_returning = labs_data
+            
+            # ✅ STORE the extracted date for later use
+            st.session_state.temp_report_date_returning = extracted_report_date
             
             add_message("assistant", 
                        f"✅ Report uploaded for {profile['name']}!\n\n"
@@ -3199,6 +3374,7 @@ def process_report_after_duplicate_check(profile, report_text):
         add_message("assistant", "❌ Error processing report. Please try again.", 
                    ["📄 Upload Report", "🤒 Check Symptoms", "Both"])
         st.session_state.bot_state = "welcome"
+
 
 def handle_more_input_selection(selection):
     """Handle the Add More/Finish options after primary insight"""
@@ -3595,7 +3771,7 @@ def handle_new_user_name_age_input(name_age_text):
             elif input_type == "📄 Upload Report" or input_type == "Both":
                 # For Both and Report, save report and symptoms
                 report_data = input_data
-                report = save_medical_report(new_member['id'], report_data["report_text"])
+                report = save_medical_report(new_member['id'], report_data["report_text"],report_data.get("report_date"))
                 
                 # Save symptoms
                 save_symptoms(new_member['id'], report_data["symptoms_text"])
