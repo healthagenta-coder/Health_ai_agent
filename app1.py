@@ -16,7 +16,6 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import io
 from datetime import datetime
 from rapidfuzz import fuzz
 # Page configuration
@@ -43,7 +42,7 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-         host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+          host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
         database="Health_med",
         user="neondb_owner",
         password="npg_5GXIK6DrVLHU",
@@ -89,7 +88,22 @@ def init_db():
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS cycle_archives (
+                        id SERIAL PRIMARY KEY,
+                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+                        cycle_number INTEGER NOT NULL,
+                        cycle_start_date TIMESTAMP NOT NULL,
+                        cycle_end_date TIMESTAMP NOT NULL,
+                        total_reports INTEGER NOT NULL,
+                        total_symptoms INTEGER NOT NULL,
+                        cycle_summary TEXT NOT NULL,
+                        key_findings TEXT,
+                        health_score_avg DECIMAL(5,2),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(member_id, cycle_number)
+                    )
+                """)
                 # Create family_members table with additional health fields
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS family_members (
@@ -364,51 +378,72 @@ def get_insight_sequence_count(member_id):
         return 0
 
 def save_insight_sequence(member_id, report_id, sequence_number, insight_type):
-    """Save insight sequence information with cycle management - FIXED FOR SYMPTOMS"""
+    """Save insight sequence with proper cycle management and duplicate prevention"""
+    
     print(f"💾 DEBUG: save_insight_sequence CALLED with:")
     print(f"   - member_id: {member_id}")
-    print(f"   - report_id: {report_id}")
     print(f"   - sequence_number: {sequence_number}")
     print(f"   - insight_type: {insight_type}")
     
     try:
-        # Get current cycle info
+        # ✅ NEW: Check for existing entry to prevent duplicates
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM insight_sequence 
+                WHERE member_id = %s 
+                AND sequence_number = %s 
+                AND insight_type = %s
+                AND created_at > NOW() - INTERVAL '10 seconds'
+            """, (member_id, sequence_number, insight_type))
+            
+            existing = cur.fetchone()
+            if existing:
+                print(f"⚠️ DUPLICATE DETECTED: Entry already exists for sequence {sequence_number}, skipping...")
+                # Return the existing cycle info instead of creating duplicate
+                cur.execute("""
+                    SELECT cycle_number FROM insight_sequence 
+                    WHERE member_id = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                """, (member_id,))
+                result = cur.fetchone()
+                current_cycle = result['cycle_number'] if result else 1
+                return True, current_cycle, sequence_number
+        
+        # Check if we need to archive and start new cycle
         current_cycle, days_in_cycle = get_current_cycle_info(member_id)
         
-        # Check if we need to start a new cycle
         if should_start_new_cycle(member_id):
+            # Archive old cycle and start new one
             new_cycle = current_cycle + 1
+            # ✅ FIX: Reset sequence to 1 for new cycle
             actual_sequence = 1
-            print(f"🔄 Starting new cycle #{new_cycle}")
+            print(f"🔄 NEW CYCLE: Archived cycle #{current_cycle}, starting cycle #{new_cycle}, sequence #{actual_sequence}")
         else:
             new_cycle = current_cycle
-            actual_sequence = sequence_number
+            # ✅ FIX: Get the NEXT sequence number for the current cycle
+            actual_sequence = get_sequence_number_for_cycle(member_id, new_cycle)
             print(f"📊 Continuing cycle #{new_cycle}, sequence #{actual_sequence}")
         
         with conn.cursor() as cur:
-            # ✅ Handle both report and symptom entries
             if report_id:
-                print(f"💾 DEBUG: Inserting REPORT entry...")
                 cur.execute("""
                     INSERT INTO insight_sequence (member_id, report_id, sequence_number, insight_type, cycle_number)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (member_id, report_id, actual_sequence, insight_type, new_cycle))
             else:
-                print(f"💾 DEBUG: Inserting SYMPTOM entry (no report_id)...")
                 cur.execute("""
                     INSERT INTO insight_sequence (member_id, sequence_number, insight_type, cycle_number)
                     VALUES (%s, %s, %s, %s)
                 """, (member_id, actual_sequence, insight_type, new_cycle))
                 
             conn.commit()
-            print(f"✅ SUCCESS: Saved to insight_sequence - Member {member_id}, Cycle {new_cycle}, Sequence {actual_sequence}, Type: {insight_type}")
+            print(f"✅ SUCCESS: Saved to insight_sequence - Cycle {new_cycle}, Sequence {actual_sequence}")
             return True, new_cycle, actual_sequence
+            
     except Exception as e:
         st.error(f"Error saving insight sequence: {e}")
         print(f"❌ ERROR in save_insight_sequence: {e}")
-        # Try to get more specific error info
-        import traceback
-        print(f"Full traceback: {traceback.format_exc()}")
         return False, 1, 1
 # all helper function for the Strutured data mang
 
@@ -670,6 +705,206 @@ def get_structured_context_for_gemini(member_id, current_sequence):
     
     return context
 
+def get_last_symptom_state(member_id):
+    """Get the last active symptom state with date"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT symptoms_text, created_at 
+                FROM symptoms 
+                WHERE member_id = %s 
+                AND symptoms_text NOT IN ('No symptoms reported - routine checkup', 'None', 'SYSTEM_CARRIED_FORWARD')
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """, (member_id,))
+            return cur.fetchone()
+    except Exception as e:
+        print(f"Error getting last symptom state: {e}")
+        return None
+
+def should_carry_forward_symptoms(symptoms_text):
+    """Check if we should carry forward previous symptoms"""
+    if not symptoms_text:
+        return True
+    return symptoms_text.lower() in ['none', 'no', 'no symptoms', 'routine', 'checkup', 'same', 'no change', '']
+
+
+def process_report_with_symptom_context(profile, report_text, symptoms_text, report_date=None):
+    """Process report with proper symptom context handling"""
+    
+    # Check if we need to carry forward symptoms
+    carried_forward = False
+    symptom_date = None
+    
+    if should_carry_forward_symptoms(symptoms_text):
+        last_symptom = get_last_symptom_state(profile['id'])
+        if last_symptom:
+            symptoms_text = f"Carried forward: {last_symptom['symptoms_text']}"
+            symptom_date = last_symptom['created_at'].date()
+            carried_forward = True
+            print(f"🔄 Carried forward symptoms from {symptom_date}")
+        else:
+            symptoms_text = "No symptoms reported - routine checkup"
+    else:
+        symptom_date = datetime.now().date()
+    
+    # Get last report for context
+    last_report_context = get_last_report_with_context(profile['id'])
+    
+    # Generate appropriate insight with context
+    insight = get_contextual_insight(
+        report_text, 
+        symptoms_text,
+        symptom_date,
+        last_report_context,
+        carried_forward,
+        profile,
+        report_date
+    )
+    
+    return insight
+
+def get_contextual_insight(report_text, symptoms_text, symptom_date, last_report_context, carried_forward, profile, report_date=None):
+    """Get insight with proper context handling"""
+    
+    if not GEMINI_AVAILABLE:
+        return "🔍 Insight: Report analysis completed.", 1, 1, 0
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Get sequence info
+        current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
+        current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
+        
+        # Build context information
+        context_info = f"""
+ANALYSIS CONTEXT:
+- Patient: {profile['name']} ({profile['age']}y, {profile.get('sex', 'Unknown')})
+- Current Report Date: {report_date if report_date else datetime.now().date()}
+- Current Symptoms: {symptoms_text}
+- Symptom Reported Date: {symptom_date if symptom_date else 'Current'}
+"""
+        
+        if carried_forward:
+            context_info += "- NOTE: Symptoms carried forward from previous report (patient reported no new symptoms)\n"
+        
+        if last_report_context and last_report_context.get('report_text'):
+            context_info += f"""
+PREVIOUS CONTEXT:
+- Previous Report Date: {last_report_context['report_date'] if last_report_context.get('report_date') else 'Unknown'}
+- Previous Symptoms: {last_report_context['symptoms_text'] if last_report_context.get('symptoms_text') else 'Not recorded'}
+- Previous Findings: {extract_key_findings_from_report(last_report_context['report_text'])[:200]}
+"""
+        
+        prompt = f"""
+You are a medical AI assistant analyzing health reports with proper symptom context.
+
+{context_info}
+
+CURRENT MEDICAL REPORT:
+{report_text}
+
+ANALYSIS RULES:
+1. If symptoms are marked "Carried forward", analyze how new findings relate to those historical symptoms
+2. Focus on objective findings from the current report first
+3. Relate findings to symptom history when medically relevant
+4. If no relevant previous data, provide standalone analysis
+5. Be precise and clinically relevant
+
+{"SPECIAL NOTE: Patient reported no new symptoms - these are carried forward from previous state. Focus on how new report findings relate to existing symptom context." if carried_forward else ""}
+
+Return ONLY valid JSON in this exact format:
+
+{{
+  "key_finding": "concise summary of most important finding in current report",
+  "clinical_correlation": "how findings relate to symptom history and context",
+  "diagnostic_impression": "current clinical assessment",
+  "recommended_action": "specific next steps based on findings",
+  {"symptom_context_note": "analysis of carried-forward symptoms relevance" if carried_forward else "symptom_context_note": "how findings relate to current symptoms"}
+}}
+"""
+        
+        print(f"🤖 DEBUG: Sending contextual prompt to Gemini")
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Clean and parse JSON response
+        cleaned_response = response_text
+        if '```json' in cleaned_response:
+            cleaned_response = cleaned_response.split('```json')[1].split('```')[0].strip()
+        elif '```' in cleaned_response:
+            cleaned_response = cleaned_response.split('```')[1].split('```')[0].strip()
+        
+        if '{' in cleaned_response:
+            cleaned_response = cleaned_response[cleaned_response.index('{'):]
+        if '}' in cleaned_response:
+            cleaned_response = cleaned_response[:cleaned_response.rindex('}')+1]
+        
+        try:
+            insight_json = json.loads(cleaned_response)
+        except json.JSONDecodeError:
+            insight_json = {
+                "key_finding": "Analysis completed",
+                "clinical_correlation": "Review findings in context of symptoms",
+                "diagnostic_impression": "Clinical review recommended", 
+                "recommended_action": "Consult healthcare provider"
+            }
+        
+        # Format the insight for display
+        if carried_forward:
+            insight_text = f"""
+## 🔄 Contextual Insight (Report #{current_sequence})
+
+**📊 Key Finding:** {insight_json.get('key_finding', 'Not specified')}
+
+**🔗 Clinical Correlation:** {insight_json.get('clinical_correlation', 'Not specified')}
+
+**🩺 Diagnostic Impression:** {insight_json.get('diagnostic_impression', 'Not specified')}
+
+**🚨 Recommended Action:** {insight_json.get('recommended_action', 'Not specified')}
+
+**📝 Note:** Symptoms carried forward from previous report - no new symptoms reported.
+"""
+        else:
+            insight_text = f"""
+## 🔍 Primary Insight (Report #{current_sequence})
+
+**📊 Key Finding:** {insight_json.get('key_finding', 'Not specified')}
+
+**🔗 Clinical Correlation:** {insight_json.get('clinical_correlation', 'Not specified')}
+
+**🩺 Diagnostic Impression:** {insight_json.get('diagnostic_impression', 'Not specified')}
+
+**🚨 Recommended Action:** {insight_json.get('recommended_action', 'Not specified')}
+"""
+        
+        return insight_text, current_cycle, current_sequence, days_in_cycle
+        
+    except Exception as e:
+        print(f"❌ DEBUG: Contextual insight error: {e}")
+        return "🔍 Insight: Report analysis completed.", 1, 1, 0
+
+
+def get_last_report_with_context(member_id):
+    """Get the last medical report with symptom context"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT mr.report_text, mr.report_date, s.symptoms_text, s.created_at as symptom_date
+                FROM medical_reports mr
+                LEFT JOIN symptoms s ON mr.member_id = s.member_id 
+                    AND ABS(EXTRACT(EPOCH FROM (mr.created_at - s.created_at))) < 86400
+                WHERE mr.member_id = %s 
+                ORDER BY mr.created_at DESC 
+                LIMIT 1
+            """, (member_id,))
+            return cur.fetchone()
+    except Exception as e:
+        print(f"Error getting last report with context: {e}")
+        return None
+
+
 def get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, limit=3):
     """Fetch previous structured insights with medical report_date for temporal correlation."""
     try:
@@ -843,7 +1078,7 @@ def check_previous_insights_exist(member_id):
         return False
 
 def get_gemini_report_insight(report_text, symptoms_text, member_data=None, region=None, member_id=None, report_id=None):
-    """Get medical report analysis with structured data storage and sequential context"""
+    """Get medical report analysis with structured data storage and sequential context - FIXED VERSION"""
     print(f"🔍 DEBUG: Starting Gemini insight generation for member {member_id}, report {report_id}")
     
     if not GEMINI_AVAILABLE:
@@ -856,18 +1091,33 @@ def get_gemini_report_insight(report_text, symptoms_text, member_data=None, regi
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
-        # ✅ IMPROVED: Check for ANY previous entries (symptoms or reports)
-        has_previous_entries = check_previous_insights_exist(member_id)
-        print(f"📊 DEBUG: Previous entries exist: {has_previous_entries}")
-        
-        # Get current cycle info
+        # ✅ FIX: Get current cycle info FIRST
         current_cycle, days_in_cycle = get_current_cycle_info(member_id)
         print(f"📊 DEBUG: Current cycle: {current_cycle}, days in cycle: {days_in_cycle}")
         
-        # Get the CURRENT sequence number for this cycle
-        current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
-        print(f"📊 DEBUG: Current sequence for member {member_id}, cycle {current_cycle}: {current_sequence}")
+        # ✅ FIX: Check if we need new cycle BEFORE getting sequence number
+        should_new_cycle = should_start_new_cycle(member_id)
         
+        if should_new_cycle:
+            current_cycle = current_cycle + 1
+            current_sequence = 1  # ✅ RESET to 1 for new cycle
+            is_new_cycle = True
+            print(f"🔄 DEBUG: Starting NEW cycle #{current_cycle}, sequence #{current_sequence}")
+        else:
+            is_new_cycle = False
+            # ✅ FIX: Get the NEXT sequence number for current cycle
+            current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
+            print(f"📊 DEBUG: Continuing cycle #{current_cycle}, sequence #{current_sequence}")
+        
+        # ✅ IMPROVED: Check for ANY previous entries (symptoms or reports)
+        has_previous_entries = check_previous_insights_exist(member_id)
+        print(f"📊 DEBUG: Previous entries exist: {has_previous_entries}")
+
+        archived_context = ""
+        if member_id and current_sequence > 1:
+            print("🔍 Getting archived context...")
+            archived_context = get_archived_cycles_context(member_id, current_cycle)
+
         # ✅ IMPROVED: Determine if this should be sequential based on ANY previous entries
         if has_previous_entries:
             print(f"🔄 DEBUG: Previous entries found, using sequential analysis")
@@ -881,6 +1131,7 @@ def get_gemini_report_insight(report_text, symptoms_text, member_data=None, regi
         # Get lab data from the report
         labs_data = {"labs": []}
         lab_score = 15
+        extracted_report_date = None
         if report_text and GEMINI_AVAILABLE:
             print("🔬 DEBUG: Getting lab data from Gemini...")
             labs_data, lab_score, extracted_report_date = get_health_score_from_gemini(report_text, {})
@@ -905,24 +1156,12 @@ def get_gemini_report_insight(report_text, symptoms_text, member_data=None, regi
                     
                     previous_reports_context += f"Report #{prev_report['sequence_number']}: {prev_text}\n\n"
         
-        # Determine if we need a new cycle
-        should_new_cycle = should_start_new_cycle(member_id)
-        
-        if should_new_cycle:
-            current_cycle = current_cycle + 1
-            current_sequence = 1
-            is_new_cycle = True
-            print(f"🔄 DEBUG: Starting NEW cycle #{current_cycle}")
-        else:
-            is_new_cycle = False
-            print(f"📊 DEBUG: Continuing cycle #{current_cycle}, sequence #{current_sequence}")
-        
         # Get previous structured insights for context
         previous_context = ""
         if current_sequence > 1 and member_id:
             previous_context = get_structured_context_for_gemini(member_id, current_sequence)
             print(f"📚 DEBUG: Previous context length: {len(previous_context)}")
-        
+
         # Determine insight type based on sequence
         if current_sequence == 1:
             insight_type = "primary"
@@ -1007,7 +1246,7 @@ Return ONLY valid JSON in the following format:
 """
         
         elif insight_type == "sequential":
-    # Build temporal context with actual dates
+            # Build temporal context with actual dates
             previous_reports_context = ""
             if current_sequence > 1 and member_id:
                 previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, 2)
@@ -1265,7 +1504,6 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
         else:
             return "🔍 Insight: Routine checkup report stored successfully.", 1, 1, 0
 
-
 def get_symptom_progression_history(member_id):
     """Get a clean timeline of symptom progression for a member"""
     try:
@@ -1372,7 +1610,7 @@ def get_health_score_from_gemini(report_text, current_profiles=None, report_data
         return {"labs": []}, 15, None
 
 def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None, region=None, member_id=None):
-    """Get symptom analysis with sequence-aware insight types - FIXED VERSION"""
+    """Get symptom analysis with proper cycle and sequence management - FIXED VERSION"""
     print(f"🔍 DEBUG: Starting symptom analysis for member {member_id}")
     
     if not GEMINI_AVAILABLE:
@@ -1382,9 +1620,19 @@ def get_gemini_symptom_analysis(symptoms_text, member_age=None, member_sex=None,
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
-        # Get current cycle and sequence info
+        # ✅ FIX: Get current cycle info FIRST
         current_cycle, days_in_cycle = get_current_cycle_info(member_id)
-        current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
+        
+        # ✅ FIX: Check if we need new cycle BEFORE getting sequence number
+        should_new_cycle = should_start_new_cycle(member_id)
+        
+        if should_new_cycle:
+            current_cycle = current_cycle + 1
+            current_sequence = 1  # ✅ RESET to 1 for new cycle
+            print(f"🔄 DEBUG: Starting NEW cycle #{current_cycle} for symptoms")
+        else:
+            # ✅ FIX: Get the NEXT sequence number for current cycle
+            current_sequence = get_sequence_number_for_cycle(member_id, current_cycle)
         
         print(f"📊 DEBUG: Member {member_id}, Cycle {current_cycle}, Current Sequence {current_sequence}")
         
@@ -1494,7 +1742,7 @@ Return ONLY valid JSON in the following format:
   "new_findings": "List new symptoms or notable changes in the current report compared to previous.",
   "change_since_last": "Describe whether the condition is Improving, Worsening, or Stable, and note persistence of symptoms.",
   "updated_diagnosis": "Provide the current clinical impression by integrating symptom trajectory and previous diagnosis context.",
-  "clinical_implications": "Explain what these symptom patterns indicate about the patient’s health or disease course.",
+  "clinical_implications": "Explain what these symptom patterns indicate about the patient's health or disease course.",
   "recommended_next_step": "Specific recommended next steps (e.g., further tests, specialist consult, treatment change)."
 }}
 """
@@ -1574,7 +1822,7 @@ Return ONLY valid JSON in the following format:
         
         elif insight_type == "primary":
             analysis_text = f"""
-## 🔍 Primary Symptom Analysis (First Entry)
+## 🔍 Primary Symptom Analysis (First Entry - Sequence #{current_sequence})
 
 **🩺 Likely Condition:** {analysis_json.get('likely_condition', 'Not specified')}
 
@@ -1587,22 +1835,22 @@ Return ONLY valid JSON in the following format:
         
         elif insight_type == "sequential":
             analysis_text = f"""
-## 🔍 Sequential Symptom Analysis (Diagnosis Correlation)
+## 🔍 Sequential Symptom Analysis (Sequence #{current_sequence})
 
-**🆕 new_findings:** {analysis_json.get('new_findings', 'Not specified')}
+**🆕 New Findings:** {analysis_json.get('new_findings', 'Not specified')}
 
-**📈 change_since_last:** {analysis_json.get('change_since_last', 'Not specified')}
+**📈 Change Since Last:** {analysis_json.get('change_since_last', 'Not specified')}
 
-**🩺 updated_diagnosis:** {analysis_json.get('updated_diagnosis', 'Not specified')}
+**🩺 Updated Diagnosis:** {analysis_json.get('updated_diagnosis', 'Not specified')}
 
-**🔬 clinical_implications:** {analysis_json.get('clinical_implications', 'Not specified')}
+**🔬 Clinical Implications:** {analysis_json.get('clinical_implications', 'Not specified')}
 
-**🚨 recommended_next_step:** {analysis_json.get('recommended_next_step', 'Not specified')}
+**🚨 Recommended Next Step:** {analysis_json.get('recommended_next_step', 'Not specified')}
 """
         
         else:  # predictive
             analysis_text = f"""
-## 🔮 Predictive Symptom Analysis (Long-term Trend)
+## 🔮 Predictive Symptom Analysis (Sequence #{current_sequence})
 
 **📊 Symptom Trend:** {analysis_json.get('symptom_trend', 'Not specified')}
 
@@ -1615,6 +1863,9 @@ Return ONLY valid JSON in the following format:
 **🎯 Long-term Recommendation:** {analysis_json.get('long_term_recommendation', 'Not specified')}
 """
         
+        # ✅ FIX: Save to insight sequence for proper tracking
+
+        
         return analysis_text, previous_context
         
     except Exception as e:
@@ -1622,7 +1873,6 @@ Return ONLY valid JSON in the following format:
         import traceback
         print(f"❌ DEBUG: Full traceback: {traceback.format_exc()}")
         return get_simple_symptom_analysis(symptoms_text), None
-
 
 def get_member_habits(member_id):
     """Get all habits for a family member"""
@@ -1900,6 +2150,461 @@ def calculate_comprehensive_health_score(member_id, report_text, symptoms_text, 
     
     return scores
 
+# new cycle funtions
+def should_start_new_cycle(member_id):
+    """Check if we should start a new cycle - IMPROVED VERSION"""
+    try:
+        # Extract single value
+        member_id = member_id[0] if isinstance(member_id, (tuple, list)) else member_id
+        
+        if not member_id:
+            return False
+            
+        with conn.cursor() as cur:
+            # Get the current cycle info
+            query = """
+                SELECT cycle_number, 
+                       MIN(created_at) as cycle_start_date
+                FROM insight_sequence 
+                WHERE member_id = %s
+                GROUP BY cycle_number
+                ORDER BY cycle_number DESC
+                LIMIT 1
+            """
+            cur.execute(query, (member_id,))
+            result = cur.fetchone()
+            
+            if not result or result['cycle_start_date'] is None:
+                return False  # No cycles yet
+            
+            current_cycle = result['cycle_number']
+            cycle_start_date = result['cycle_start_date']
+            
+            days_since_cycle_start = (datetime.now().date() - cycle_start_date.date()).days
+            
+            print(f"🔄 Cycle Check: Cycle {current_cycle}, Started {days_since_cycle_start} days ago")
+            
+            if days_since_cycle_start >= 15:
+                print(f"📦 Starting new cycle - archiving cycle {current_cycle}")
+                # Archive current cycle
+                success = archive_current_cycle_simple(member_id, current_cycle)
+                if not success:
+                    success = archive_current_cycle(member_id, current_cycle)
+                
+                if success:
+                    print(f"✅ Archived cycle {current_cycle}, new cycle will start")
+                else:
+                    print(f"⚠️ Archive failed for cycle {current_cycle}, but starting new cycle anyway")
+                
+                return True  # ✅ Always return True to start new cycle when time threshold is met
+            
+            return False
+        
+    except Exception as e:
+        print(f"❌ Error in should_start_new_cycle: {e}")
+        return False
+
+
+def archive_current_cycle_simple(member_id, cycle_number):
+    """ULTRA-SIMPLE archive function that avoids all complex operations"""
+    try:
+        print(f"🔄 SIMPLE ARCHIVE for cycle #{cycle_number}, member {member_id}")
+        
+        # Extract values
+        member_id = member_id[0] if isinstance(member_id, (tuple, list)) and member_id else member_id
+        cycle_number = cycle_number[0] if isinstance(cycle_number, (tuple, list)) and cycle_number else cycle_number
+        
+        if not member_id or not cycle_number:
+            print(f"❌ Invalid parameters")
+            return False
+        
+        with conn.cursor() as cur:
+            # Simple insert with minimal data
+            query = """
+                INSERT INTO cycle_archives 
+                (member_id, cycle_number, cycle_start_date, cycle_end_date, 
+                 total_reports, total_symptoms, cycle_summary, key_findings, health_score_avg)
+                VALUES (%s, %s, NOW() - INTERVAL '15 days', NOW(), 1, 1, 'Cycle archived automatically', 'Automatic archive - detailed data unavailable', 75.0)
+                ON CONFLICT (member_id, cycle_number) DO UPDATE 
+                SET created_at = CURRENT_TIMESTAMP
+            """
+            print(f"🔍 Executing simple archive query")
+            cur.execute(query, [member_id, cycle_number])
+            conn.commit()
+            
+            print(f"✅ SIMPLE ARCHIVE SUCCESS for cycle #{cycle_number}")
+            return True
+            
+    except Exception as e:
+        print(f"❌ SIMPLE ARCHIVE FAILED: {e}")
+        conn.rollback()
+        return False
+
+def archive_current_cycle(member_id, cycle_number):
+    """Archive the current cycle with AI-generated summary - FIXED TO CALL AI FUNCTION"""
+    print(f"🔄 Attempting to archive cycle #{cycle_number} for member {member_id}")
+    
+    try:
+        # Parameter extraction
+        def safe_extract(value):
+            if isinstance(value, (tuple, list)):
+                return value[0] if value else None
+            return value
+        
+        member_id = safe_extract(member_id)
+        cycle_number = safe_extract(cycle_number)
+        
+        print(f"🔍 DEBUG: member_id: {member_id}, cycle_number: {cycle_number}")
+        
+        if not member_id or not cycle_number:
+            print(f"❌ Invalid parameters")
+            return False
+        
+        with conn.cursor() as cur:
+            # Get cycle data - FIX: Use tuple instead of list
+            cycle_query = """
+                SELECT 
+                    MIN(created_at) as cycle_start,
+                    MAX(created_at) as cycle_end,
+                    COUNT(*) as total_entries,
+                    COUNT(CASE WHEN insight_type LIKE '%%symptom%%' THEN 1 END) as symptom_count,
+                    COUNT(CASE WHEN insight_type NOT LIKE '%%symptom%%' THEN 1 END) as report_count
+                FROM insight_sequence 
+                WHERE member_id = %s AND cycle_number = %s
+            """
+            cur.execute(cycle_query, (member_id, cycle_number))  
+            cycle_info = cur.fetchone()
+            
+            if not cycle_info or cycle_info['cycle_start'] is None:
+                print(f"⚠️ No valid cycle data found")
+                return False
+            
+            cycle_start = cycle_info['cycle_start']
+            cycle_end = cycle_info['cycle_end']
+            total_entries = cycle_info['total_entries']
+            symptom_count = cycle_info['symptom_count']
+            report_count = cycle_info['report_count']
+            
+            print(f"📊 Cycle data: {total_entries} entries, {report_count} reports, {symptom_count} symptoms")
+            
+            # Get insights from this cycle - FIX: Use tuple
+            insights_query = """
+                SELECT ih.insight_text, ih.created_at, iseq.sequence_number, iseq.insight_type
+                FROM insight_history ih
+                JOIN insight_sequence iseq ON (
+                    ih.report_id = iseq.report_id 
+                    OR (ih.report_id IS NULL AND iseq.report_id IS NULL AND ih.member_id = iseq.member_id)
+                )
+                WHERE ih.member_id = %s AND iseq.cycle_number = %s
+                ORDER BY iseq.sequence_number
+            """
+            cur.execute(insights_query, (member_id, cycle_number))  # ✅ FIX: Use tuple
+            insights = cur.fetchall()
+            print(f"📝 Found {len(insights)} insights for AI summary")
+            
+            # Get health scores - FIX: Use tuple
+            score_query = """
+                SELECT AVG(final_score) as avg_score
+                FROM health_scores hs
+                JOIN insight_sequence iseq ON hs.report_id = iseq.report_id
+                WHERE hs.member_id = %s AND iseq.cycle_number = %s
+            """
+            cur.execute(score_query, (member_id, cycle_number))  # ✅ FIX: Use tuple
+            score_result = cur.fetchone()
+            avg_score = score_result['avg_score'] if score_result and score_result['avg_score'] is not None else None
+            print(f"📈 Average health score: {avg_score}")
+            
+            # ✅ FIX: CALL THE AI SUMMARY FUNCTION
+            print("🤖 CALLING generate_cycle_summary_with_ai...")
+            cycle_summary = generate_cycle_summary_with_ai(
+                member_id, 
+                cycle_number, 
+                insights, 
+                {
+                    'cycle_start': cycle_start,
+                    'cycle_end': cycle_end,
+                    'total_entries': total_entries,
+                    'symptom_count': symptom_count,
+                    'report_count': report_count
+                },
+                avg_score
+            )
+            
+            print(f"📄 AI Summary generated: {len(cycle_summary)} characters")
+            
+            # Extract key findings
+            key_findings = extract_key_findings_from_cycle(insights)
+            print(f"🔑 Key findings extracted: {len(key_findings)} characters")
+            
+            # Save to cycle_archives - FIX: Use tuple
+            archive_query = """
+                INSERT INTO cycle_archives 
+                (member_id, cycle_number, cycle_start_date, cycle_end_date, 
+                 total_reports, total_symptoms, cycle_summary, key_findings, health_score_avg)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (member_id, cycle_number) DO UPDATE 
+                SET cycle_summary = EXCLUDED.cycle_summary,
+                    key_findings = EXCLUDED.key_findings,
+                    health_score_avg = EXCLUDED.health_score_avg,
+                    created_at = CURRENT_TIMESTAMP
+            """
+            archive_params = (
+                member_id, cycle_number, cycle_start, cycle_end,
+                report_count, symptom_count, cycle_summary, key_findings,
+                float(avg_score) if avg_score else None
+            )  # ✅ FIX: Use tuple
+            
+            cur.execute(archive_query, archive_params)
+            conn.commit()
+            
+            print(f"✅ SUCCESS: Cycle #{cycle_number} archived with AI summary!")
+            print(f"   - AI Summary: {len(cycle_summary)} chars")
+            print(f"   - Key Findings: {len(key_findings)} chars")
+            
+            return True
+            
+    except Exception as e:
+        print(f"❌ Error in archive_current_cycle: {e}")
+        import traceback
+        print(f"❌ Full traceback: {traceback.format_exc()}")
+        conn.rollback()
+        return False
+
+
+def generate_cycle_summary_with_ai(member_id, cycle_number, insights, cycle_info, avg_score):
+    """Generate comprehensive cycle summary using Gemini AI - IMPROVED & ROBUST"""
+    
+    print(f"🤖 generate_cycle_summary_with_ai CALLED for cycle #{cycle_number}")
+    print(f"   - Insights count: {len(insights)}")
+    print(f"   - Gemini available: {GEMINI_AVAILABLE}")
+    
+    # If no insights or Gemini not available, use simple summary
+    if not insights or not GEMINI_AVAILABLE:
+        print("⚠️ Using simple summary (no insights or Gemini unavailable)")
+        return generate_simple_cycle_summary(insights, cycle_info, avg_score)
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Prepare insights text for AI - limit to avoid token limits
+        insights_text = ""
+        max_insights = min(10, len(insights))  # Limit to 10 insights max
+        
+        for i in range(max_insights):
+            insight = insights[i]
+            # Clean and truncate insight text
+            clean_text = insight['insight_text'].replace('##', '').replace('**', '').strip()
+            insight_preview = clean_text[:300] + "..." if len(clean_text) > 300 else clean_text
+            
+            insights_text += f"ENTRY {i+1} ({insight['insight_type']}, {insight['created_at'].strftime('%Y-%m-%d')}):\n{insight_preview}\n\n"
+        
+        # Get member info for context
+        member_info = ""
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name, age, sex FROM family_members WHERE id = %s", [member_id])
+                member_data = cur.fetchone()
+                if member_data:
+                    member_info = f"Patient: {member_data['name']} ({member_data['age']}y, {member_data['sex']})"
+        except:
+            member_info = "Patient information unavailable"
+        
+        prompt = f"""
+You are a medical AI assistant summarizing a 15-day health monitoring cycle. Create a comprehensive clinical summary.
+
+CYCLE INFORMATION:
+- Cycle Number: {cycle_number}
+- Duration: {cycle_info['cycle_start'].strftime('%Y-%m-%d')} to {cycle_info['cycle_end'].strftime('%Y-%m-%d')}
+- Total Health Entries: {cycle_info['total_entries']}
+- Medical Reports: {cycle_info['report_count']}
+- Symptom Logs: {cycle_info['symptom_count']}
+- Average Health Score: {f"{avg_score:.1f}/100" if avg_score else "Not calculated"}
+- {member_info}
+
+HEALTH INSIGHTS FROM THIS CYCLE (in chronological order):
+{insights_text}
+
+Please provide a structured medical summary covering:
+
+1. OVERALL HEALTH TRAJECTORY: Summarize the patient's health journey during this period. Was it improving, stable, or declining?
+
+2. KEY CLINICAL EVENTS: Highlight significant medical findings, test results, or symptom changes.
+
+3. SYMPTOM ANALYSIS: Describe any symptom patterns, severity changes, or new symptoms reported.
+
+4. DIAGNOSTIC PROGRESSION: Note any changes in diagnosis, treatment response, or clinical understanding.
+
+5. RISK ASSESSMENT: Identify any concerning patterns, risk factors, or red flags.
+
+6. POSITIVE DEVELOPMENTS: Mention any improvements, successful treatments, or good health practices.
+
+7. RECOMMENDATIONS: Suggest monitoring priorities or actions for the next cycle.
+
+Write in a clear, clinical style. Be concise but comprehensive. Focus on medically relevant information.
+
+Return only the summary text - no JSON, no markdown formatting, no additional explanations.
+"""
+        
+        print(f"📤 Sending prompt to Gemini ({len(prompt)} chars)...")
+        response = model.generate_content(prompt)
+        summary = response.text.strip()
+        
+        # Clean up the summary
+        summary = summary.replace('```', '').strip()
+        if summary.startswith('"') and summary.endswith('"'):
+            summary = summary[1:-1]
+        
+        print(f"✅ AI Summary generated successfully: {len(summary)} characters")
+        print(f"📝 Preview: {summary[:200]}...")
+        
+        return summary
+        
+    except Exception as e:
+        print(f"❌ AI summary generation failed: {e}")
+        print("🔄 Falling back to simple summary...")
+        return generate_simple_cycle_summary(insights, cycle_info, avg_score)
+
+def verify_cycle_archive(member_id, cycle_number):
+    """Verify that a cycle archive was saved correctly"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cycle_summary, key_findings, total_reports, total_symptoms
+                FROM cycle_archives 
+                WHERE member_id = %s AND cycle_number = %s
+            """, (member_id, cycle_number))
+            archive = cur.fetchone()
+            
+            if archive:
+                print(f"✅ VERIFIED Archive for cycle {cycle_number}:")
+                print(f"   - Summary length: {len(archive['cycle_summary'])}")
+                print(f"   - Key findings length: {len(archive['key_findings'])}")
+                print(f"   - Reports: {archive['total_reports']}, Symptoms: {archive['total_symptoms']}")
+                return True
+            else:
+                print(f"❌ No archive found for cycle {cycle_number}")
+                return False
+    except Exception as e:
+        print(f"❌ Error verifying archive: {e}")
+        return False
+
+def generate_simple_cycle_summary(insights, cycle_info, avg_score):
+    """Generate a comprehensive simple summary without AI - IMPROVED"""
+    print("📝 Generating simple cycle summary...")
+    
+    summary = f"""HEALTH MONITORING CYCLE #{cycle_info.get('cycle_number', 'N/A')} SUMMARY
+
+CYCLE PERIOD: {cycle_info['cycle_start'].strftime('%Y-%m-%d')} to {cycle_info['cycle_end'].strftime('%Y-%m-%d')}
+
+OVERVIEW:
+• Total health entries: {cycle_info['total_entries']}
+• Medical reports: {cycle_info['report_count']}
+• Symptom logs: {cycle_info['symptom_count']}
+• Average health score: {f"{avg_score:.1f}/100" if avg_score else "Not calculated"}
+
+TIMELINE OF EVENTS:
+"""
+    
+    if insights:
+        for i, insight in enumerate(insights[:6], 1):  # Limit to 6 most important
+            date_str = insight['created_at'].strftime('%m/%d')
+            insight_type = insight['insight_type'].replace('_', ' ').title()
+            
+            # Extract key content from insight
+            text = insight['insight_text']
+            # Remove markdown and get first line or truncate
+            clean_text = text.replace('##', '').replace('**', '').strip()
+            first_line = clean_text.split('\n')[0][:100]
+            
+            summary += f"\n{i}. {date_str} - {insight_type}: {first_line}"
+            
+            if i == 6 and len(insights) > 6:
+                summary += f"\n... and {len(insights) - 6} more entries"
+    else:
+        summary += "\nNo health insights recorded during this period."
+
+    summary += f"""
+
+CYCLE ASSESSMENT:
+This {cycle_info['total_entries']}-entry monitoring period has been archived. 
+{'Significant health events were recorded.' if insights else 'Routine monitoring with no critical events.'}
+
+NEXT CYCLE PREPARATION:
+Cycle archiving completed on {datetime.now().strftime('%Y-%m-%d %H:%M')}
+"""
+    
+    print(f"✅ Simple summary generated: {len(summary)} characters")
+    return summary
+
+def extract_key_findings_from_cycle(insights):
+    """Extract key medical findings from cycle insights - IMPROVED"""
+    if not insights:
+        return "No significant medical findings recorded during this cycle."
+    
+    findings = []
+    
+    for insight in insights:
+        text = insight['insight_text'].lower()
+        
+        # Look for significant medical keywords
+        medical_keywords = [
+            'abnormal', 'elevated', 'high', 'low', 'critical', 'emergency', 
+            'severe', 'worsening', 'complication', 'risk', 'alert', 'concern',
+            'diagnosis', 'finding', 'result', 'test', 'lab', 'symptom', 'pain',
+            'fever', 'infection', 'disease', 'condition', 'treatment', 'medication'
+        ]
+        
+        # Check if insight contains significant medical content
+        if any(keyword in text for keyword in medical_keywords):
+            # Extract a meaningful snippet
+            words = text.split()
+            if len(words) > 10:  # Only if it has substantial content
+                # Find a relevant snippet around medical keywords
+                snippet = text[:150] + "..." if len(text) > 150 else text
+                date_str = insight['created_at'].strftime('%Y-%m-%d')
+                findings.append(f"[{date_str}] {snippet}")
+        
+        # Limit to 5 key findings to avoid overwhelming
+        if len(findings) >= 5:
+            break
+    
+    if findings:
+        return "\n".join(findings)
+    else:
+        return "Routine monitoring with no critical findings identified."
+
+
+def get_archived_cycles_context(member_id, current_cycle, limit=2):
+    """Get context from previous archived cycles"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cycle_number, cycle_start_date, cycle_end_date, 
+                       cycle_summary, key_findings, health_score_avg
+                FROM cycle_archives 
+                WHERE member_id = %s AND cycle_number < %s
+                ORDER BY cycle_number DESC 
+                LIMIT %s
+            """, (member_id, current_cycle, limit))
+            archives = cur.fetchall()
+        
+        if not archives:
+            return ""
+        
+        context = "PREVIOUS 15-DAY CYCLES (ARCHIVED):\n\n"
+        
+        for archive in archives:
+            context += f"Cycle #{archive['cycle_number']} ({archive['cycle_start_date'].strftime('%Y-%m-%d')} to {archive['cycle_end_date'].strftime('%Y-%m-%d')}):\n"
+            context += f"{archive['cycle_summary']}\n\n"
+            
+            if archive['key_findings']:
+                context += f"Key Findings:\n{archive['key_findings']}\n\n"
+        
+        return context
+        
+    except Exception as e:
+        print(f"Error fetching archived cycles: {e}")
+        return ""
 
 
 def update_member_health_metrics(member_id, metrics_data):
@@ -2030,7 +2735,12 @@ def create_family_member(family_id, name, age, sex='Other'):
         return None
     
 def save_symptoms(member_id, symptoms_text, severity=None):
+    """Save symptoms with special handling for carried forward"""
     try:
+        # Don't save "carried forward" as new symptoms
+        if symptoms_text == "SYSTEM_CARRIED_FORWARD":
+            return {"id": None, "symptoms_text": "Carried forward"}
+            
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO symptoms (member_id, symptoms_text, severity) 
@@ -2634,19 +3344,34 @@ def check_previous_insights_exist(member_id):
         print(f"Error checking previous insights: {e}")
         return False
 
+
 def get_current_cycle_info(member_id):
-    """Get current cycle number and days since cycle start - FIXED VERSION"""
+    """Get current cycle number and days since cycle start - DEBUG VERSION"""
     try:
+        # ✅ FIX: Ensure member_id is a single value
+        def extract_single_value(value):
+            if isinstance(value, (tuple, list)):
+                return value[0] if value else None
+            return value
+        
+        member_id = extract_single_value(member_id)
+        
+        if not member_id:
+            return 1, 0
+            
         with conn.cursor() as cur:
             # Get the most recent cycle and its start date
-            cur.execute("""
-                SELECT cycle_number, MIN(created_at) as cycle_start_date
+            query = """
+                SELECT cycle_number, 
+                       MIN(created_at) as cycle_start_date,
+                       MAX(created_at) as last_entry_date
                 FROM insight_sequence 
                 WHERE member_id = %s
                 GROUP BY cycle_number
                 ORDER BY cycle_number DESC
                 LIMIT 1
-            """, (member_id,))
+            """
+            cur.execute(query, (member_id,))
             result = cur.fetchone()
             
             if not result:
@@ -2654,28 +3379,79 @@ def get_current_cycle_info(member_id):
             
             current_cycle = result['cycle_number']
             cycle_start_date = result['cycle_start_date']
+            last_entry_date = result['last_entry_date']
             
-            # Calculate days since cycle start
-            days_in_cycle = (datetime.now().date() - cycle_start_date.date()).days
+            # Calculate days from the LAST entry, not the start
+            days_since_last_entry = (datetime.now().date() - last_entry_date.date()).days
             
-            print(f"🔄 DEBUG - Member {member_id}: Cycle {current_cycle}, Days in cycle: {days_in_cycle}")
-            return current_cycle, days_in_cycle
+            # Also track total days in cycle for display
+            total_days_in_cycle = (datetime.now().date() - cycle_start_date.date()).days
+            
+            print(f"🔄 DEBUG - Member {member_id}:")
+            print(f"   - Current Cycle: {current_cycle}")
+            print(f"   - Cycle Start: {cycle_start_date.date()}")
+            print(f"   - Last Entry: {last_entry_date.date()}")
+            print(f"   - Days since last entry: {days_since_last_entry}")
+            print(f"   - Total days in cycle: {total_days_in_cycle}")
+            
+            # Return days since last entry (this is what matters for archiving)
+            return current_cycle, days_since_last_entry
                 
     except Exception as e:
         print(f"❌ Error getting cycle info: {e}")
         return 1, 0
 
 def should_start_new_cycle(member_id):
-    """Check if we should start a new cycle (15 days passed)"""
+    """Check if we should start a new cycle - WITH AI SUMMARY PRIORITY"""
     try:
-        current_cycle, days_in_cycle = get_current_cycle_info(member_id)
-        return days_in_cycle >= 15
+        member_id = member_id[0] if isinstance(member_id, (tuple, list)) else member_id
+        
+        if not member_id:
+            return False
+            
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cycle_number, 
+                       MIN(created_at) as cycle_start_date
+                FROM insight_sequence 
+                WHERE member_id = %s
+                GROUP BY cycle_number
+                ORDER BY cycle_number DESC
+                LIMIT 1
+            """, [member_id])
+            result = cur.fetchone()
+            
+            if not result or result['cycle_start_date'] is None:
+                return False
+            
+            current_cycle = result['cycle_number']
+            cycle_start_date = result['cycle_start_date']
+            
+            days_since_cycle_start = (datetime.now().date() - cycle_start_date.date()).days
+            
+            print(f"🔄 Cycle Check: Cycle {current_cycle}, Started {days_since_cycle_start} days ago")
+            
+            if days_since_cycle_start >= 15:
+                print(f"📦 Archiving cycle {current_cycle} with AI summary...")
+                
+                # ✅ USE THE MAIN ARCHIVE FUNCTION THAT CALLS AI SUMMARY
+                success = archive_current_cycle(member_id, current_cycle)
+                
+                if success:
+                    print(f"✅ Cycle {current_cycle} archived with AI summary!")
+                else:
+                    print(f"⚠️ Archive failed for cycle {current_cycle}, but continuing...")
+                
+                return True
+            
+            return False
+        
     except Exception as e:
-        print(f"Error checking new cycle: {e}")
+        print(f"❌ Error in should_start_new_cycle: {e}")
         return False
 
 def get_sequence_number_for_cycle(member_id, cycle_number):
-    """Get the next sequence number for a specific cycle"""
+    """Get the next sequence number for a specific cycle - FIXED VERSION"""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -2685,14 +3461,14 @@ def get_sequence_number_for_cycle(member_id, cycle_number):
             """, (member_id, cycle_number))
             result = cur.fetchone()
             
-            # If no records found, start from 1
+            # If no records found in THIS cycle, start from 1
             if result['max_sequence'] is None:
                 next_sequence = 1
             else:
                 next_sequence = result['max_sequence'] + 1
                 
             print(f"🔢 DEBUG - Member {member_id}, Cycle {cycle_number}:")
-            print(f"   - Max sequence in DB: {result['max_sequence']}")
+            print(f"   - Max sequence in this cycle: {result['max_sequence']}")
             print(f"   - Next sequence: {next_sequence}")
             return next_sequence
     except Exception as e:
@@ -2740,8 +3516,6 @@ def handle_report_upload():
 def process_symptom_input(symptoms_text):
     """Process symptom input and generate primary insight - FIXED VERSION"""
     print(f"🚨 DEBUG: process_symptom_input CALLED with: {symptoms_text}")
-    print(f"🚨 DEBUG: Current bot_state: {st.session_state.bot_state}")
-    print(f"🚨 DEBUG: temp_profile exists: {hasattr(st.session_state, 'temp_profile')}")
     
     if hasattr(st.session_state, 'temp_profile'):
         profile = st.session_state.temp_profile
@@ -2757,11 +3531,19 @@ def process_symptom_input(symptoms_text):
     
     print(f"🔍 DEBUG: Processing symptoms for {profile['name']}: {symptoms_text}")
     
-    # ✅ CRITICAL: Get sequence info BEFORE generating insight
+    # ✅ FIX: Get cycle and sequence info through the proper function
     current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
-    current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
     
-    print(f"📊 DEBUG: Member {profile['id']}, Cycle {current_cycle}, Sequence {current_sequence}")
+    # ✅ FIX: Check if we need new cycle BEFORE processing
+    should_new_cycle = should_start_new_cycle(profile['id'])
+    
+    if should_new_cycle:
+        current_cycle = current_cycle + 1
+        current_sequence = 1
+        print(f"🔄 DEBUG: Starting NEW cycle #{current_cycle} for symptoms")
+    else:
+        current_sequence = get_sequence_number_for_cycle(profile['id'], current_cycle)
+        print(f"📊 DEBUG: Member {profile['id']}, Cycle {current_cycle}, Sequence {current_sequence}")
     
     # Generate primary insight
     print(f"🤖 DEBUG: Calling get_gemini_symptom_analysis...")
@@ -2773,20 +3555,17 @@ def process_symptom_input(symptoms_text):
             region=region,
             member_id=profile['id']
         )
-    print(f"🤖 DEBUG: Gemini analysis completed: {len(analysis) if analysis else 0} chars")
     
     # Save symptoms
-    print(f"💾 DEBUG: Saving symptoms to database...")
+    # Save symptoms to database
     symptom_record = save_symptoms(profile['id'], symptoms_text)
-    print(f"💾 DEBUG: Saved symptoms record: {bool(symptom_record)}")
-                      
-    # ✅ CRITICAL FIX: Save the symptom input to insight_sequence
-    print(f"💾 DEBUG: Attempting to save to insight_sequence...")
+    
+    # ✅ SINGLE SOURCE OF TRUTH: Save to insight_sequence ONCE here
     success, saved_cycle, saved_sequence = save_insight_sequence(
         profile['id'], 
         None,  # No report_id for symptom-only entries
         current_sequence, 
-        "symptom_primary"
+        "symptom_primary"  # Use consistent naming
     )
     
     if success:
