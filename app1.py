@@ -4,7 +4,7 @@ from psycopg2.extras import RealDictCursor
 import google.generativeai as genai
 import PyPDF2
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, date,timedelta
 import json
 import uuid
 import re
@@ -116,6 +116,18 @@ def init_db():
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS usage_tracking (
+                        id SERIAL PRIMARY KEY,
+                        family_id INTEGER REFERENCES families(id) ON DELETE CASCADE,
+                        interaction_date DATE NOT NULL,
+                        interaction_count INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(family_id, interaction_date)
+                    )
+                """)
+
                 cur.execute("""
     CREATE TABLE IF NOT EXISTS structured_insights (
         id SERIAL PRIMARY KEY,
@@ -246,6 +258,7 @@ def init_session_state():
         # CONSENT STATES - SIMPLIFIED
         "consent_given": False,
         "show_consent_modal": False,  # ADD THIS LINE
+        "pending_both": False,
     }
     
     for key, value in defaults.items():
@@ -318,6 +331,258 @@ def render_consent_modal():
 - Privacy policy may change; we will notify users
 - Continued use after updates implies acceptance""")
 # Utility functions
+
+def get_daily_interaction_count(family_id):
+    """Get today's interaction count for a family"""
+    try:
+        today = date.today()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT interaction_count 
+                FROM usage_tracking 
+                WHERE family_id = %s AND interaction_date = %s
+            """, (family_id, today))
+            result = cur.fetchone()
+            return result['interaction_count'] if result else 0
+    except Exception as e:
+        print(f"Error getting interaction count: {e}")
+        return 0
+
+def check_daily_limit_reached(family_id, limit=4):
+    """Check if daily interaction limit is reached"""
+    count = get_daily_interaction_count(family_id)
+    return count >= limit
+
+
+def get_family_member_count(family_id):
+    """Get the number of family members"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) as count 
+                FROM family_members 
+                WHERE family_id = %s
+            """, (family_id,))
+            result = cur.fetchone()
+            return result['count'] if result else 0
+    except Exception as e:
+        print(f"Error getting family member count: {e}")
+        return 0
+
+def check_family_member_limit(family_id, limit=5):
+    """Check if family member limit is reached"""
+    count = get_family_member_count(family_id)
+    return count >= limit
+
+def validate_file_size(uploaded_file, max_size_mb=5):
+    """Validate uploaded file size"""
+    if uploaded_file is None:
+        return True, ""
+    
+    file_size_mb = uploaded_file.size / (1024 * 1024)  # Convert to MB
+    
+    if file_size_mb > max_size_mb:
+        return False, f"File size ({file_size_mb:.2f} MB) exceeds the {max_size_mb} MB limit. Please upload a smaller file."
+    
+    return True, ""
+
+
+def display_usage_status():
+    """Display current usage status in sidebar"""
+    if st.session_state.current_family:
+        family_id = st.session_state.current_family['id']
+        
+        st.sidebar.divider()
+        st.sidebar.subheader("📊 Usage Status")
+        
+        # Daily interactions
+        interaction_count = get_daily_interaction_count(family_id)
+        remaining_interactions = max(0, 4 - interaction_count)
+        
+        # Create progress bar
+        progress = min(interaction_count / 4, 1.0)
+        color = "green" if progress < 0.5 else "orange" if progress < 0.75 else "red"
+        
+        st.sidebar.markdown(f"""
+        **Daily Interactions: {interaction_count}/4**
+        """)
+        st.sidebar.progress(progress)
+        
+        if remaining_interactions > 0:
+            st.sidebar.success(f"✅ {remaining_interactions} interaction{'s' if remaining_interactions != 1 else ''} remaining today")
+        else:
+            st.sidebar.error("❌ Daily limit reached. Resets at midnight.")
+        
+        # Family members
+        member_count = get_family_member_count(family_id)
+        remaining_members = max(0, 5 - member_count)
+        
+        member_progress = min(member_count / 5, 1.0)
+        
+        st.sidebar.markdown(f"""
+        **Family Members: {member_count}/5**
+        """)
+        st.sidebar.progress(member_progress)
+        
+        if remaining_members > 0:
+            st.sidebar.info(f"ℹ️ Can add {remaining_members} more member{'s' if remaining_members != 1 else ''}")
+        else:
+            st.sidebar.warning("⚠️ Maximum family members reached")
+
+def increment_interaction_count(family_id):
+    """Increment today's interaction count"""
+    try:
+        today = date.today()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO usage_tracking (family_id, interaction_date, interaction_count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (family_id, interaction_date) 
+                DO UPDATE SET interaction_count = usage_tracking.interaction_count + 1
+                RETURNING interaction_count
+            """, (family_id, today))
+            conn.commit()
+            result = cur.fetchone()
+            return result['interaction_count'] if result else 1
+    except Exception as e:
+        print(f"Error incrementing interaction count: {e}")
+        conn.rollback()
+        return 0
+
+def process_uploaded_report_with_validation(uploaded_file):
+    """Process uploaded report with file size validation"""
+    # Validate file size first
+    is_valid, error_message = validate_file_size(uploaded_file, max_size_mb=5)
+    
+    if not is_valid:
+        add_message("user", f"Attempted to upload: {uploaded_file.name}")
+        add_message("assistant", 
+                   f"❌ **File Too Large**\n\n"
+                   f"{error_message}\n\n"
+                   "**Tips to reduce file size:**\n"
+                   "- Compress the PDF using online tools\n"
+                   "- Remove unnecessary pages\n"
+                   "- Reduce image quality in the PDF",
+                   ["📄 Try Another File", "🤒 Check Symptoms"])
+        st.session_state.bot_state = "welcome"
+        if 'last_processed_file' in st.session_state:
+            del st.session_state.last_processed_file
+        return False
+    
+    # Continue with normal processing
+    process_uploaded_report(uploaded_file)
+    return True
+
+def handle_name_age_input_with_limits(name_age_text):
+    """Handle name/age input with family member limit check"""
+    if st.session_state.current_family:
+        family_id = st.session_state.current_family['id']
+        
+        # Check family member limit
+        if check_family_member_limit(family_id):
+            add_message("user", name_age_text)
+            add_message("assistant", 
+                       "⚠️ **Family Member Limit Reached**\n\n"
+                       "You've reached the maximum of 5 family members.\n\n"
+                       "To add a new member, you may need to remove an existing profile first.",
+                       ["🔙 Back to Chat"])
+            st.session_state.bot_state = "welcome"
+            return
+    
+    # Continue with normal profile creation
+    handle_name_age_input(name_age_text)
+
+def check_and_show_limit_reset():
+    """Show notification if limits have reset"""
+    if st.session_state.current_family:
+        family_id = st.session_state.current_family['id']
+        
+        # Check if it's a new day and show welcome back message
+        today = date.today()
+        last_interaction_key = f"last_interaction_{family_id}"
+        
+        if last_interaction_key in st.session_state:
+            last_date = st.session_state[last_interaction_key]
+            if last_date != today:
+                st.sidebar.success("🎉 Daily limit reset! You have 4 new interactions today.")
+        
+        st.session_state[last_interaction_key] = today
+
+def count_file_upload_interaction():
+    """Count file upload as an interaction"""
+    if st.session_state.current_family:
+        family_id = st.session_state.current_family['id']
+        
+        # Check if limit already reached
+        if check_daily_limit_reached(family_id):
+            return False
+        
+        new_count = increment_interaction_count(family_id)
+        print(f"✅ File upload counted: {new_count}/4")
+        return True
+    return True
+
+def handle_user_input_with_limits(user_input):
+    """Handle user input with daily limit check - FIXED COUNTING FOR BOTH"""
+    if st.session_state.current_family:
+        family_id = st.session_state.current_family['id']
+        
+        # Check daily limit
+        current_count = get_daily_interaction_count(family_id)
+        print(f"🔍 CURRENT COUNT BEFORE: {current_count}/4")
+        
+        if check_daily_limit_reached(family_id):
+            add_message("assistant", 
+                       "⚠️ **Daily Interaction Limit Reached**\n\n"
+                       "You've used all 4 interactions for today. Your limit will reset at midnight!")
+            return
+        
+        should_count = False
+        
+        # DEBUG: Print current state for troubleshooting
+        print(f"🔍 DEBUG COUNTING - State: {st.session_state.bot_state}")
+        print(f"🔍 Pending Both: {getattr(st.session_state, 'pending_both', 'NOT SET')}")
+        print(f"🔍 Pending Both Returning: {getattr(st.session_state, 'pending_both_returning', 'NOT SET')}")
+        
+        # Check if this is part of ANY "Both" flow
+        is_both_flow = (getattr(st.session_state, 'pending_both', False) or 
+                       getattr(st.session_state, 'pending_both_returning', False))
+        
+        # STRATEGY: Count "Both" only when symptoms are entered, not when report is uploaded
+        if st.session_state.bot_state in ["awaiting_symptoms_for_both_report", "awaiting_symptoms_for_both_returning"]:
+            # This is the symptoms part of "Both" - count as ONE interaction
+            should_count = True
+            print(f"✅ Counting 'Both' completion as 1 interaction")
+            
+        elif st.session_state.bot_state in ["awaiting_symptom_input", "awaiting_symptom_input_new_user"]:
+            # Regular symptom input (not part of "Both")
+            should_count = True
+            print(f"✅ Counting regular symptoms as 1 interaction")
+            
+        elif st.session_state.bot_state in ["awaiting_report_symptoms", "awaiting_report_symptoms_new_user"]:
+            # Regular report with symptoms
+            should_count = True
+            print(f"✅ Counting report+symptoms as 1 interaction")
+        
+        # EXPLICITLY DON'T COUNT report upload for ANY "Both" flow
+        elif st.session_state.bot_state in ["awaiting_report", "awaiting_report_new_user"]:
+            if is_both_flow:
+                print(f"⏸️  Not counting report upload for 'Both' (will count later)")
+                should_count = False
+            else:
+                # Regular report upload (not part of "Both")
+                should_count = True
+                print(f"✅ Counting regular report as 1 interaction")
+        
+        if should_count:
+            new_count = increment_interaction_count(family_id)
+            print(f"✅ FINAL: Interaction counted: {new_count}/4")
+        else:
+            print(f"⏸️  No interaction counted this time")
+    
+    # Continue with normal input handling
+    handle_user_input(user_input)
+
 def extract_text_from_pdf(uploaded_file):
     try:
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
@@ -345,7 +610,7 @@ def check_duplicate_report(member_id, uploaded_text):
         
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, report_text, report_date 
+                SELECT id, report_text, created_at 
                 FROM medical_reports 
                 WHERE member_id = %s
                 ORDER BY created_at DESC
@@ -359,7 +624,7 @@ def check_duplicate_report(member_id, uploaded_text):
             similarity = fuzz.ratio(cleaned_uploaded, db_text)
             
             if similarity >= THRESHOLD:
-                report_date = record['report_date'].strftime('%Y-%m-%d') if record['report_date'] else 'Unknown date'
+                report_date = record['created_at'].strftime('%Y-%m-%d') if record['created_at'] else 'Unknown date'
                 return True, similarity, report_date
         
         return False, 0, None
@@ -665,6 +930,121 @@ def get_previous_structured_insights_with_context(member_id, current_sequence):
     except Exception as e:
         print(f"❌ Error fetching structured insights with context: {e}")
         return []
+
+def check_report_upload_status(member_id, report_date, extracted_report_date):
+    """
+    Check the status of report upload and return appropriate message
+    """
+    current_date = datetime.now().date()
+    
+    # Convert and validate report_date
+    report_date_converted = convert_to_date(report_date)
+    if report_date_converted is None:
+        report_date_converted = current_date
+    
+    try:
+        with conn.cursor() as cur:
+            # Get the latest report date for this member (excluding current)
+            cur.execute("""
+                SELECT MAX(report_date) as latest_report_date 
+                FROM medical_reports 
+                WHERE member_id = %s AND report_date IS NOT NULL
+                AND id != (SELECT MAX(id) FROM medical_reports WHERE member_id = %s)
+            """, (member_id, member_id))
+            result = cur.fetchone()
+            latest_report_date = convert_to_date(result['latest_report_date']) if result and result['latest_report_date'] else None
+            
+            # Get the latest REAL symptom date (exclude routine checkups)
+            cur.execute("""
+                SELECT MAX(reported_date) as latest_symptom_date 
+                FROM symptoms 
+                WHERE member_id = %s
+                AND symptoms_text != 'No symptoms reported - routine checkup'
+            """, (member_id,))
+            symptom_result = cur.fetchone()
+            latest_symptom_date = convert_to_date(symptom_result['latest_symptom_date']) if symptom_result and symptom_result['latest_symptom_date'] else None
+    
+    except Exception as e:
+        print(f"Error checking report status: {e}")
+        return '✅ Report added successfully.'
+    
+    # Case 6: No report date found in document
+    if extracted_report_date is None:
+        return '⚠️ **Date not detected in report.** Added using upload time. Please ensure report date is visible next time.'
+    
+    # Case 3: Backdated report uploaded after newer one (out of order)
+    if latest_report_date and report_date_converted < latest_report_date:
+        return '⚠️ **Older report added later.** Timeline kept unchanged. Try uploading reports in order for better insights.'
+    
+    # Case 4: Backdated report uploaded after REAL symptom entry
+    if latest_symptom_date and report_date_converted < latest_symptom_date:
+        return f'⚠️ **Report from {report_date_converted.strftime("%d %b %Y")} belongs before symptom entry but uploaded later.** Add reports early to match symptoms correctly.'
+    
+    # Case 2: Backdated report (older than 7 days)
+    days_difference = (current_date - report_date_converted).days
+    if days_difference > 7:
+        return f'⚠️ **Report from {report_date_converted.strftime("%d %b %Y")} added as past data.** Upload reports soon after you receive them for accurate tracking.'
+    
+    # Case 1: Normal case
+    return '✅ Report added successfully.'
+
+def show_report_status_message(member_id, report_date, extracted_report_date):
+    """
+    Display the appropriate status message for report upload
+    
+    Args:
+        member_id: ID of the family member
+        report_date: The date being used for the report
+        extracted_report_date: The date extracted from the PDF (None if not found)
+    """
+    message_type, message_text = check_report_upload_status(member_id, report_date, extracted_report_date)
+    
+    if message_type == 'success':
+        st.success(message_text)
+    elif message_type == 'warning':
+        st.warning(message_text)
+    elif message_type == 'info':
+        st.info(message_text)
+
+
+# def process_report_with_status_message(profile, report_text, extracted_report_date):
+#     """
+#     Modified version of your report processing that includes status messages
+#     """
+#     # Determine the report date to use
+#     if extracted_report_date:
+#         report_date = extracted_report_date
+#     else:
+#         report_date = datetime.now().date()
+    
+#     # Save the report
+#     report = save_medical_report(profile['id'], report_text, report_date)
+    
+#     if report:
+#         # Show appropriate status message
+#         show_report_status_message(profile['id'], report_date, extracted_report_date)
+        
+#         # Continue with rest of processing...
+#         return report
+    
+#     return None
+
+# def add_status_message_to_chat(member_id, report_date, extracted_report_date):
+#     """
+#     Add status message to chat history instead of showing popup
+#     """
+#     message_type, message_text = check_report_upload_status(member_id, report_date, extracted_report_date)
+    
+#     # Add to chat history with appropriate formatting
+#     if message_type == 'warning':
+#         formatted_message = f"⚠️ {message_text}"
+#     elif message_type == 'info':
+#         formatted_message = f"ℹ️ {message_text}"
+#     else:
+#         formatted_message = message_text
+    
+#     add_message("assistant", formatted_message)
+
 
 def get_structured_context_for_gemini(member_id, current_sequence):
     """Get formatted context from previous reports AND symptom entries for sequential analysis"""
@@ -1423,6 +1803,9 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 **🩺 Probable Diagnosis:** {insight_json.get('probable_diagnosis', 'Not specified')}
 
 **🚨 Next Step:** {insight_json.get('next_step', 'Not specified')}
+
+> 💡 **Primary Insight:** 
+> Additional data could uncover underlying issues.
 """
         
         elif insight_type == "sequential":
@@ -1438,6 +1821,9 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 **🔬 Clinical Implications:** {insight_json.get('clinical_implications', 'Not specified')}
 
 **🚨 Recommended Next Step:** {insight_json.get('recommended_next_step', 'Not specified')}
+
+> 💡 **Sequential Insight:**  
+> Upload more data to gain deeper and more comprehensive insights.
 """
         
         else:  # predictive
@@ -1453,6 +1839,9 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 **📈 Health Score Trend:** {insight_json.get('health_score_trend', 'Not specified')}
 
 **🕒 Timeline Reference:** {insight_json.get('timeline_reference', 'Not specified')}
+
+> 💡 **Predictive Insight:**  
+> A trend has been detected. Upload more data to unlock the complete prediction..
 """
         
         # Calculate health score
@@ -1831,6 +2220,9 @@ Return ONLY valid JSON in the following format:
 **🚨 Immediate Steps:** {analysis_json.get('immediate_steps', 'Not specified')}
 
 **📋 Recommended Evaluation:** {analysis_json.get('recommended_evaluation', 'Not specified')}
+
+> 💡 **Primary Insight:** 
+> Additional data could uncover underlying issues.
 """
         
         elif insight_type == "sequential":
@@ -1846,6 +2238,9 @@ Return ONLY valid JSON in the following format:
 **🔬 Clinical Implications:** {analysis_json.get('clinical_implications', 'Not specified')}
 
 **🚨 Recommended Next Step:** {analysis_json.get('recommended_next_step', 'Not specified')}
+
+> 💡 **Sequential Insight:**  
+> Upload more data to gain deeper and more comprehensive insights.
 """
         
         else:  # predictive
@@ -1861,6 +2256,9 @@ Return ONLY valid JSON in the following format:
 **✅ Protective Measures:** {analysis_json.get('protective_measures', 'Not specified')}
 
 **🎯 Long-term Recommendation:** {analysis_json.get('long_term_recommendation', 'Not specified')}
+
+> 💡 **Predictive Insight:**  
+> A trend has been detected. Upload more data to unlock the complete prediction..
 """
         
         # ✅ FIX: Save to insight sequence for proper tracking
@@ -2699,6 +3097,11 @@ def create_family(phone_number, head_name, region=None):
             )
             result = cur.fetchone()
             conn.commit()
+            
+            # ✅ Initialize usage tracking with 0 count
+            if result:
+                initialize_usage_tracking(result['id'])
+            
             return result
     except Exception as e:
         conn.rollback()
@@ -2713,6 +3116,23 @@ def get_family_members(family_id):
     except Exception as e:
         st.error(f"Database error: {e}")
         return []
+
+def initialize_usage_tracking(family_id):
+    """Initialize usage tracking for a new family - start at 0"""
+    try:
+        today = date.today()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO usage_tracking (family_id, interaction_date, interaction_count)
+                VALUES (%s, %s, 0)
+                ON CONFLICT (family_id, interaction_date) 
+                DO NOTHING
+            """, (family_id, today))
+            conn.commit()
+            print(f"✅ Initialized usage tracking for family {family_id}")
+    except Exception as e:
+        print(f"Error initializing usage tracking: {e}")
+        conn.rollback()
 
 def create_family_member(family_id, name, age, sex='Other'):
     try:
@@ -2734,18 +3154,22 @@ def create_family_member(family_id, name, age, sex='Other'):
         st.error(f"Error creating family member: {e}")
         return None
     
-def save_symptoms(member_id, symptoms_text, severity=None):
-    """Save symptoms with special handling for carried forward"""
+def save_symptoms(member_id, symptoms_text, severity=None, reported_date=None):
+    """Save symptoms with special handling for carried forward and custom dates"""
     try:
         # Don't save "carried forward" as new symptoms
         if symptoms_text == "SYSTEM_CARRIED_FORWARD":
             return {"id": None, "symptoms_text": "Carried forward"}
-            
+        
+        # Use provided date or current date
+        if reported_date is None:
+            reported_date = datetime.now().date()
+        
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO symptoms (member_id, symptoms_text, severity) 
-                VALUES (%s, %s, %s) RETURNING *""",
-                (member_id, symptoms_text, severity)
+                """INSERT INTO symptoms (member_id, symptoms_text, severity, reported_date) 
+                VALUES (%s, %s, %s, %s) RETURNING *""",
+                (member_id, symptoms_text, severity, reported_date)
             )
             conn.commit()
             return cur.fetchone()
@@ -2832,7 +3256,7 @@ def add_message(role, content, buttons=None):
     })
 
 def handle_input_type_selection(input_type):
-    """Handle the selection of input type (Symptom/Report/Both)"""
+    """Handle the selection of input type (Symptom/Report/Both) - FIXED COUNTING"""
     add_message("user", input_type)
     
     # Store the input type
@@ -2852,7 +3276,7 @@ def handle_input_type_selection(input_type):
         elif input_type == "Both":
             add_message("assistant", "Let's start with the medical report. Please upload it (PDF format)")
             st.session_state.bot_state = "awaiting_report_new_user"
-            st.session_state.pending_both = True
+            st.session_state.pending_both = True  # ✅ SET THE FLAG
     
     else:
         # RETURNING USERS: Check if we already have a temp_profile from previous interaction
@@ -2872,6 +3296,7 @@ def handle_input_type_selection(input_type):
                 add_message("assistant", f"Let's start with the medical report for {profile['name']}. Please upload it (PDF format)")
                 st.session_state.bot_state = "awaiting_report"
                 st.session_state.pending_both_returning = True
+                st.session_state.pending_both = True  # ✅ SET THE FLAG
         else:
             # No active profile, ask who it's for
             profile_buttons = [f"{p['name']} ({p['age']}y)" for p in st.session_state.current_profiles]
@@ -3158,7 +3583,9 @@ Do not mention the Patient name
             return "🔍 Insight: Routine checkup report stored successfully."
 
 def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence_number, member_info=None, previous_reports_context=""):
-    """Get medical report analysis for new users with proper sequencing for Both option - FIXED VERSION"""
+    """Get medical report analysis for new users with proper sequencing for Both option - WITH DATE EXTRACTION"""
+    print(f"🔍 DEBUG: Starting new_user_both insight with date extraction")
+    
     if not GEMINI_AVAILABLE:
         if symptoms_text.lower() != "no symptoms reported - routine checkup":
             return f"🔍 Insight: Report uploaded with symptoms: {symptoms_text}. Manual review recommended."
@@ -3168,20 +3595,35 @@ def get_gemini_report_insight_new_user_both(report_text, symptoms_text, sequence
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         
+        # ✅ EXTRACT DATE FROM REPORT
+        extracted_report_date = None
+        labs_data = {"labs": []}
+        if report_text and GEMINI_AVAILABLE:
+            print("🔍 Extracting date and lab data from report in new_user_both...")
+            labs_data, _, extracted_report_date = get_health_score_from_gemini(report_text, {})
+            print(f"🔍 Extracted date: {extracted_report_date}")
+            print(f"🔍 Extracted {len(labs_data.get('labs', []))} lab tests")
+        
+        # Determine the date to use
+        if extracted_report_date:
+            current_date_str = extracted_report_date
+            date_context = f"Report Date: {extracted_report_date}"
+        else:
+            current_date_str = datetime.now().date().strftime('%Y-%m-%d')
+            date_context = f"Report Date: Not detected in document (using upload date: {current_date_str})"
+        
         # Always use primary insight for new users (first entry)
         insight_type = "primary"
         
-        print(f"🎯 New User Both - Sequence {sequence_number}, Type: {insight_type}")
+        print(f"🎯 New User Both - Sequence {sequence_number}, Type: {insight_type}, Date: {current_date_str}")
         
         prompt = f"""
-You are a medical AI assistant analyzing a patient's **first medical report** in the system. 
+You are a medical AI assistant analyzing a patient's **first medical report** in the system.
 You MUST use both the **medical report findings (primary)** and the **presenting symptoms (supporting)** in your analysis.
 
-RULES:
-- You are REQUIRED to reference at least one relevant presenting symptom in your reasoning for the probable diagnosis.
-- If the report is clear, use symptoms to support or increase diagnostic confidence.
-- If the report is unclear or normal, rely more on symptoms to guide next steps.
-- If symptoms are irrelevant, explicitly mention that in the probable_diagnosis field.
+DATE CONTEXT:
+{date_context}
+- Analysis Date: {datetime.now().date().strftime('%Y-%m-%d')}
 
 PATIENT INFORMATION:
 {member_info}
@@ -3205,9 +3647,11 @@ OUTPUT — Return ONLY valid JSON in this format:
   "probable_diagnosis": "Diagnosis or clinical impression based on findings + at least one referenced symptom (if present)",
   "next_step": "Specific, actionable next step such as diagnostic test, referral, treatment, or monitoring"
 }}
+
+Return ONLY the JSON object. No explanations, no markdown, no additional text.
 """
 
-        
+        print(f"🤖 DEBUG: Sending new_user_both prompt to Gemini (length: {len(prompt)})")
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         print(f"🤖 DEBUG: Gemini raw response: {response_text}")
@@ -3235,7 +3679,9 @@ OUTPUT — Return ONLY valid JSON in this format:
             insight_json = json.loads(cleaned_response)
             print(f"✅ DEBUG: Successfully parsed JSON response")
             
-            # FORMAT THE INSIGHT FOR DISPLAY
+            # FORMAT THE INSIGHT FOR DISPLAY WITH DATE CONTEXT
+            date_display = f" (Report Date: {extracted_report_date})" if extracted_report_date else " (Date not detected in report)"
+            
             insight_text = f"""
 ## 🔍 Primary Insight (First Report)
 
@@ -3243,14 +3689,23 @@ OUTPUT — Return ONLY valid JSON in this format:
 
 **🩺 Probable Diagnosis:** {insight_json.get('probable_diagnosis', 'Not specified')}
 
-**🚨 Next Stddep:** {insight_json.get('next_step', 'Not specified')}
+**🚨 Next Step:** {insight_json.get('next_step', 'Not specified')}
+
+> 💡 **Primary Insight:** 
+> Additional data could uncover underlying issues.
 """
+            
+            # Add note if date wasn't detected
+            if not extracted_report_date:
+                insight_text += "\n\n⚠️ *Note: Report date not detected. Please ensure the date is visible in future reports for accurate timeline tracking.*"
             
         except json.JSONDecodeError as e:
             print(f"❌ DEBUG: JSON parsing failed: {e}")
             # Fallback if JSON parsing fails
+            date_display = f" (Report Date: {extracted_report_date})" if extracted_report_date else " (Date not detected)"
+            
             insight_text = f"""
-## 🔍 Primary Insight (First Report)
+## 🔍 Primary Insight (First Report{date_display})
 
 **Based on both report and symptoms:**
 
@@ -3262,13 +3717,15 @@ OUTPUT — Return ONLY valid JSON in this format:
         return insight_text
         
     except Exception as e:
-        st.error(f"Gemini AI error: {e}")
+        print(f"❌ DEBUG: Gemini AI error in new_user_both: {e}")
         import traceback
         print(f"❌ DEBUG: Full traceback: {traceback.format_exc()}")
         
-        # Simple fallback
+        # Simple fallback with date context
+        date_display = f" (Report Date: {extracted_report_date})" if extracted_report_date else " (Date not detected)"
+        
         return f"""
-## 🔍 Primary Insight (First Report)
+## 🔍 Primary Insight (First Report{date_display})
 
 **Based on both report and symptoms:**
 
@@ -3277,12 +3734,17 @@ Report analysis completed. Symptoms: {symptoms_text}
 *Note: This is the initial analysis of your medical report and symptoms.*
 """
 
+
 def handle_symptoms_for_both_report(symptoms_text):
     """Handle symptoms input when user selected 'Both' (report already uploaded)"""
     add_message("user", symptoms_text)
     
     report_text = st.session_state.temp_report_for_both
     labs_data = getattr(st.session_state, 'temp_labs_data', {"labs": []})
+    
+    # ✅ GET THE EXTRACTED DATE FROM SESSION STATE
+    extracted_report_date = getattr(st.session_state, 'temp_report_date', None)
+    print(f"🔍 DEBUG: Extracted date from session state: {extracted_report_date}")
     
     # Process symptoms
     symptoms_lower = symptoms_text.lower()
@@ -3295,10 +3757,11 @@ def handle_symptoms_for_both_report(symptoms_text):
     st.session_state.new_user_input_data = {
         "report_text": report_text,
         "symptoms_text": symptoms_to_store,
-        "labs_data": labs_data
+        "labs_data": labs_data,
+        "report_date": extracted_report_date  # ✅ STORE THE EXTRACTED DATE
     }
     
-    # Generate insight - use the same approach as report-only
+    # Generate insight - the function will now extract date internally
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
     with st.spinner("Generating comprehensive insight..."):
@@ -3306,7 +3769,8 @@ def handle_symptoms_for_both_report(symptoms_text):
         insight_text = get_gemini_report_insight_new_user_both(
             report_text, 
             symptoms_to_store, 
-            1  # Always use sequence 1 for first report in Both flow
+            1,  # Always use sequence 1 for first report in Both flow
+            # REMOVED: extracted_report_date=extracted_date  # ❌ Remove this line
         )
     
     # Store the primary insight
@@ -3327,6 +3791,7 @@ def handle_symptoms_for_both_report(symptoms_text):
     # Clean up temporary states
     st.session_state.temp_report_for_both = None
     st.session_state.temp_labs_data = None
+    st.session_state.temp_report_date = None  # ✅ CLEAR THE DATE TOO
     st.session_state.pending_both = False
 
 def check_previous_insights_exist(member_id):
@@ -3527,10 +3992,17 @@ def process_symptom_input(symptoms_text):
     add_message("user", symptoms_text)
     
     profile = st.session_state.temp_profile
+
+    status_message = check_symptom_upload_status(profile['id'], symptoms_text)
+    #add_message("assistant", status_message)
+
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
     print(f"🔍 DEBUG: Processing symptoms for {profile['name']}: {symptoms_text}")
     
+    status_message = check_symptom_upload_status(profile['id'], symptoms_text)
+    if status_message:
+        add_message("assistant", status_message)
     # ✅ FIX: Get cycle and sequence info through the proper function
     current_cycle, days_in_cycle = get_current_cycle_info(profile['id'])
     
@@ -3808,7 +4280,7 @@ def handle_symptoms_for_both_returning(symptoms_text):
     
     # ✅ Get the extracted report date
     extracted_report_date = getattr(st.session_state, 'temp_report_date_returning', None)
-    
+    symptom_date = datetime.now().date()
     # Process symptoms
     symptoms_lower = symptoms_text.lower()
     if symptoms_lower in ['none', 'no', 'no symptoms', 'nothing', 'routine', 'checkup']:
@@ -3818,10 +4290,19 @@ def handle_symptoms_for_both_returning(symptoms_text):
         symptoms_to_store = symptoms_text
         symptom_severity = 2
     
+    # Determine report date
+    report_date = extracted_report_date if extracted_report_date else datetime.now().date()
+    
     # Save symptoms and report WITH extracted date
     symptom_record = save_symptoms(profile['id'], symptoms_to_store, symptom_severity)
-    report = save_medical_report(profile['id'], report_text, extracted_report_date)  # ✅ Pass extracted date
+    report = save_medical_report(profile['id'], report_text, report_date)
     
+    # ✅ NEW: Check and show status message
+    if report:
+        status_message = check_report_upload_status(profile['id'], report_date, extracted_report_date)
+        add_message("assistant", status_message)
+        symptom_status = check_symptom_upload_status(profile['id'], symptoms_text, symptom_date)
+        add_message("assistant", symptom_status)
     # Update report with symptom data
     if report:
         try:
@@ -3867,7 +4348,7 @@ def handle_symptoms_for_both_returning(symptoms_text):
     except Exception as e:
         st.error(f"Error saving health scores: {e}")
     
-    # Generate insight - EXTRACT ONLY THE INSIGHT TEXT FROM THE TUPLE
+    # Generate insight
     region = st.session_state.current_family.get('region') if st.session_state.current_family else None
     
     with st.spinner("Generating comprehensive insight..."):
@@ -3882,7 +4363,7 @@ def handle_symptoms_for_both_returning(symptoms_text):
     
     # Extract just the insight text from the tuple
     if isinstance(insight_result, tuple) and len(insight_result) >= 1:
-        insight_text = insight_result[0]  # First element is the insight text
+        insight_text = insight_result[0]
         current_cycle = insight_result[1] if len(insight_result) > 1 else 1
         current_sequence = insight_result[2] if len(insight_result) > 2 else 1
         days_in_cycle = insight_result[3] if len(insight_result) > 3 else 0
@@ -3910,32 +4391,51 @@ def handle_symptoms_for_both_returning(symptoms_text):
     st.session_state.temp_report_for_both_returning = None
     st.session_state.temp_labs_data_returning = None
     st.session_state.pending_both_returning = False
+    st.session_state.pending_both = False
 
 def process_report_directly(profile, report_text):
-    """Process report directly without asking for symptoms - ENSURE STRUCTURED_INSIGHTS SAVE"""
+    """Process report directly without asking for symptoms"""
     print(f"🔄 Starting direct report processing for {profile['name']}")
-    print(f"🔄 Starting direct report processing for {profile['name']}")
-    print(f"🔍 DEBUG: Member ID: {profile['id']}")
-    has_previous = check_previous_insights_exist(profile['id'])
-    print(f"🔍 DEBUG: Previous insights exist: {has_previous}")
+    
     # Set default symptoms for routine checkup
     symptoms_to_store = "No symptoms reported - routine checkup"
     symptom_severity = 1
     
-    # Get lab data if available
-    # Get lab data and report date if available
+    # Get lab data and report date
     labs_data = {"labs": []}
-    lab_score = 15
     extracted_report_date = None
     if report_text and GEMINI_AVAILABLE:
-        print("🔬 Getting lab data and report date from Gemini...")
-        labs_data, lab_score, extracted_report_date = get_health_score_from_gemini(report_text, {})
-        print(f"🔬 Extracted {len(labs_data.get('labs', []))} lab tests")
-        print(f"🔬 Extracted report date: {extracted_report_date}")
-        
+        labs_data, _, extracted_report_date = get_health_score_from_gemini(report_text, {})
+    
+    # Determine report date
+    report_date = extracted_report_date if extracted_report_date else datetime.now().date()
+    
     # Save report
-    print("💾 Saving medical report...")
-    report = save_medical_report(profile['id'], report_text, extracted_report_date)
+    report = save_medical_report(profile['id'], report_text, report_date)
+    
+    # ✅ FIX: Save routine symptoms with REPORT DATE, not current date
+    if report:
+        symptom_record = save_symptoms(
+            profile['id'], 
+            symptoms_to_store, 
+            symptom_severity, 
+            reported_date=report_date  # Use report date for routine checkup
+        )
+    
+    # Show status message (only for actual reports, not routine symptoms)
+    if report:
+        try:
+            status_message = check_report_upload_status(profile['id'], report_date, extracted_report_date)
+            if status_message:  # Only show if there's a message
+                add_message("assistant", status_message)
+        except Exception as e:
+            print(f"Error in status check: {e}")
+            add_message("assistant", "✅ Report added successfully.")
+        
+    # ✅ NEW: Check and show status message
+    # if report:
+    #     status_message = check_report_upload_status(profile['id'], report_date, extracted_report_date)
+    #     add_message("assistant", status_message)
     
     # Update report with symptom data
     if report:
@@ -3986,10 +4486,8 @@ def process_report_directly(profile, report_text):
     # ✅ CRITICAL: Save to structured_insights BEFORE generating insight - NOW WITH LAB DATA
     if report:
         try:
-            # Get current sequence number for this report
             current_sequence = get_sequence_number_for_cycle(profile['id'], 1)
             
-            # Prepare structured data WITH LAB DATA
             structured_data = {
                 'symptoms': symptoms_to_store,
                 'reports': extract_key_findings_from_report(report_text),
@@ -4001,16 +4499,15 @@ def process_report_directly(profile, report_text):
                 'risk': "Based on current findings",
                 'suggested_action': "As per insight",
                 'input_type': 'report',
-                'lab_summary': extract_lab_summary(labs_data)  # Add lab summary
+                'lab_summary': extract_lab_summary(labs_data)
             }
             
-            # Save to structured_insights WITH LAB DATA
             save_structured_insight(
                 profile['id'], 
                 report['id'], 
                 current_sequence, 
                 structured_data, 
-                labs_data  # Pass the full lab data
+                labs_data
             )
             
             print(f"✅ Saved report to structured_insights: Sequence {current_sequence} with {len(labs_data.get('labs', []))} lab tests")
@@ -4028,15 +4525,13 @@ def process_report_directly(profile, report_text):
             symptoms_to_store, 
             profile, 
             region,
-            profile['id'],  # Now we have member_id
-            report['id'] if report else None  # Now we have report_id
+            profile['id'],
+            report['id'] if report else None
         )
-    
-    # Rest of the function remains the same...
     
     # Extract just the insight text from the tuple
     if isinstance(insight_result, tuple) and len(insight_result) >= 1:
-        insight_text = insight_result[0]  # First element is the insight text
+        insight_text = insight_result[0]
         current_cycle = insight_result[1] if len(insight_result) > 1 else 1
         current_sequence = insight_result[2] if len(insight_result) > 2 else 1
         days_in_cycle = insight_result[3] if len(insight_result) > 3 else 0
@@ -4048,9 +4543,7 @@ def process_report_directly(profile, report_text):
     
     # Save insight
     if insight_text and report:
-        # Remove emoji prefixes for storage
         insight_text_clean = insight_text.replace("🔍 Primary Insight:", "").replace("🔍 Sequential Insight:", "").replace("🔮 Predictive Insight:", "").replace(f"🔄 New Cycle #{current_cycle} Started", "").strip()
-        
         saved_insight = save_insight(profile['id'], report['id'], insight_text_clean)
     
     # Build response based on sequence number
@@ -4066,7 +4559,6 @@ def process_report_directly(profile, report_text):
     
     response += f"{insight_text}\n\n"
     response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
-    
     response += "### What would you like to do next?"
     
     buttons = ["📄 Add Another Report", "🤒 Add Symptoms", "Both", "✅ Finish & Save Timeline"]
@@ -4113,25 +4605,21 @@ def process_uploaded_report(uploaded_file):
 def process_report_after_duplicate_check(profile, report_text):
     """Continue report processing after duplicate check"""
     try:
-        # ✅ ADD THIS: Extract report date BEFORE processing
+        # ✅ Extract report date BEFORE processing
         extracted_report_date = None
+        labs_data = {"labs": []}
         if report_text and GEMINI_AVAILABLE:
             labs_data, _, extracted_report_date = get_health_score_from_gemini(report_text, {})
-            # Store for later use if needed
             st.session_state.temp_report_date = extracted_report_date
+        
+        # Determine report date
+        report_date = extracted_report_date if extracted_report_date else datetime.now().date()
         
         # Check if this is part of "Both" for returning users
         if getattr(st.session_state, 'pending_both_returning', False):
             # Store the report and ask for symptoms
             st.session_state.temp_report_for_both_returning = report_text
-            
-            # Get lab data if available
-            labs_data = {"labs": []}
-            if report_text and GEMINI_AVAILABLE:
-                labs_data, _ = get_health_score_from_gemini(report_text, {})
             st.session_state.temp_labs_data_returning = labs_data
-            
-            # ✅ STORE the extracted date for later use
             st.session_state.temp_report_date_returning = extracted_report_date
             
             add_message("assistant", 
@@ -4139,7 +4627,7 @@ def process_report_after_duplicate_check(profile, report_text):
                        "Now, please describe the symptoms (e.g., 'fever and headache for 2 days')")
             st.session_state.bot_state = "awaiting_symptoms_for_both_returning"
         else:
-            # Single report upload - process directly without asking for symptoms
+            # Single report upload - process directly
             print(f"🔄 Processing single report for {profile['name']}")
             process_report_directly(profile, report_text)
         
@@ -4153,7 +4641,6 @@ def process_report_after_duplicate_check(profile, report_text):
         add_message("assistant", "❌ Error processing report. Please try again.", 
                    ["📄 Upload Report", "🤒 Check Symptoms", "Both"])
         st.session_state.bot_state = "welcome"
-
 
 def handle_more_input_selection(selection):
     """Handle the Add More/Finish options after primary insight"""
@@ -4370,38 +4857,84 @@ def render_chat_interface():
                                 st.rerun()
     
     # File uploader (conditionally displayed) - FIXED VERSION WITH DUPLICATE PREVENTION
+        # File uploader (conditionally displayed) - WITH SIZE VALIDATION
+# File uploader (conditionally displayed) - WITH SIZE VALIDATION AND COUNTING
     if st.session_state.bot_state in ["awaiting_report", "awaiting_report_new_user"]:
         st.divider()
         
-        # Use a stable key based on the state
-        uploader_key = f"report_uploader_{st.session_state.bot_state}"
-        
-        uploaded_file = st.file_uploader("Upload medical report (PDF)", 
-                                        type=["pdf"], 
-                                        key=uploader_key)
-        
-        if uploaded_file is not None:
-            # ✅ NEW: Create unique file identifier to prevent re-processing
-            file_id = f"{uploaded_file.name}_{uploaded_file.size}_{st.session_state.bot_state}"
+        # Check daily limit before showing uploader
+        if st.session_state.current_family and check_daily_limit_reached(st.session_state.current_family['id']):
+            st.warning("⚠️ Daily interaction limit reached. You can upload more reports tomorrow!")
+        else:
+            # Use a stable key based on the state
+            uploader_key = f"report_uploader_{st.session_state.bot_state}"
             
-            # Check if this file was already processed
-            if 'last_processed_file' not in st.session_state or st.session_state.last_processed_file != file_id:
-                # Mark this file as being processed
-                st.session_state.last_processed_file = file_id
+            uploaded_file = st.file_uploader("Upload medical report (PDF) - Max 5MB", 
+                                            type=["pdf"], 
+                                            key=uploader_key)
+            
+            if uploaded_file is not None:
+                # Create unique file identifier to prevent re-processing
+                file_id = f"{uploaded_file.name}_{uploaded_file.size}_{st.session_state.bot_state}"
                 
-                # Process the file based on current state
-                if st.session_state.bot_state == "awaiting_report_new_user":
-                    process_new_user_report(uploaded_file)
-                else:
-                    process_uploaded_report(uploaded_file)
-                st.rerun()
-    
+                # Check if this file was already processed
+                if 'last_processed_file' not in st.session_state or st.session_state.last_processed_file != file_id:
+                    # Mark this file as being processed
+                    st.session_state.last_processed_file = file_id
+                    
+                    # Validate file size
+                    is_valid, error_message = validate_file_size(uploaded_file, max_size_mb=5)
+                    
+                    if not is_valid:
+                        # Show error and clear file
+                        add_message("user", f"Attempted to upload: {uploaded_file.name}")
+                        add_message("assistant", 
+                                f"❌ **File Too Large**\n\n"
+                                f"{error_message}\n\n"
+                                "**Tips to reduce file size:**\n"
+                                "- Compress the PDF using online tools\n"
+                                "- Remove unnecessary pages\n"
+                                "- Reduce image quality in the PDF",
+                                ["📄 Try Another File", "🤒 Check Symptoms", "Both"])
+                        st.session_state.bot_state = "welcome"
+                        del st.session_state.last_processed_file
+                        st.rerun()
+                    else:
+                        # ✅ COUNT FILE UPLOAD AS INTERACTION
+                        can_upload = True
+                        if st.session_state.current_family:
+                            # Don't count file upload if this is part of "Both" (for both new AND returning users)
+                            if (getattr(st.session_state, 'pending_both', False) or 
+                                getattr(st.session_state, 'pending_both_returning', False)):
+                                print(f"⏸️  Not counting file upload for 'Both' (new or returning)")
+                                can_upload = True  # Allow upload without counting
+                            else:
+                                can_upload = count_file_upload_interaction()
+                                if can_upload:
+                                    print(f"✅ Counting file upload as interaction")
+                        
+                        if not can_upload:
+                            add_message("assistant", 
+                                    "⚠️ **Daily Interaction Limit Reached**\n\n"
+                                    "You've used all 4 interactions for today. Your limit will reset at midnight.")
+                            st.session_state.bot_state = "welcome"
+                            del st.session_state.last_processed_file
+                            st.rerun()
+                        else:
+                            # File size is valid and limit not reached, process normally
+                            if st.session_state.bot_state == "awaiting_report_new_user":
+                                process_new_user_report(uploaded_file)
+                            else:
+                                process_uploaded_report(uploaded_file)
+                            st.rerun()
+
     # User input
     user_input = st.chat_input("Type your message here...")
     
     if user_input:
-        handle_user_input(user_input)
+        handle_user_input_with_limits(user_input)
         st.rerun()
+
 def reset_db_connection():
     """Reset the database connection"""
     global conn
@@ -4482,6 +5015,103 @@ def handle_chat_button(button_text):
                 process_health_input_for_profile(profile)
                 break
 
+def convert_to_date(date_value):
+    """
+    Convert various date formats to date object - ENHANCED VERSION
+    """
+    if date_value is None:
+        return None
+    
+    # Already a date object
+    if isinstance(date_value, date):
+        return date_value
+    
+    # datetime object - convert to date
+    if isinstance(date_value, datetime):
+        return date_value.date()
+    
+    # String - try to parse
+    if isinstance(date_value, str):
+        # Clean the string first
+        date_str = date_value.strip()
+        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%d-%m-%Y', '%m-%d-%Y'):
+            try:
+                # Try parsing as datetime first, then extract date
+                parsed_datetime = datetime.strptime(date_str, fmt)
+                return parsed_datetime.date()
+            except ValueError:
+                continue
+    
+    # If we can't convert it, return None
+    print(f"⚠️ WARNING: Could not convert {date_value} (type: {type(date_value)}) to date")
+    return None
+
+def check_symptom_upload_status(member_id, symptoms_text, symptom_date=None):
+    """
+    Check the status of symptom upload and return appropriate message
+    """
+    current_date = datetime.now().date()
+    
+    # Convert and validate symptom_date
+    if symptom_date is None:
+        symptom_date_converted = current_date
+    else:
+        symptom_date_converted = convert_to_date(symptom_date)
+        if symptom_date_converted is None:
+            symptom_date_converted = current_date
+    
+    # NEW: Skip status check for routine checkups (auto-generated)
+    if symptoms_text == "No symptoms reported - routine checkup":
+        return None  # Don't show any message for auto-generated routine entries
+    
+    try:
+        with conn.cursor() as cur:
+            # Get the latest REAL symptom date (exclude routine checkups)
+            cur.execute("""
+                SELECT MAX(reported_date) as latest_symptom_date 
+                FROM symptoms 
+                WHERE member_id = %s 
+                AND symptoms_text != 'No symptoms reported - routine checkup'
+                AND id != (SELECT MAX(id) FROM symptoms WHERE member_id = %s)
+            """, (member_id, member_id))
+            symptom_result = cur.fetchone()
+            latest_symptom_date = convert_to_date(symptom_result['latest_symptom_date']) if symptom_result and symptom_result['latest_symptom_date'] else None
+            
+            # Get the latest report date for this member
+            cur.execute("""
+                SELECT MAX(report_date) as latest_report_date 
+                FROM medical_reports 
+                WHERE member_id = %s AND report_date IS NOT NULL
+            """, (member_id,))
+            report_result = cur.fetchone()
+            latest_report_date = convert_to_date(report_result['latest_report_date']) if report_result and report_result['latest_report_date'] else None
+    
+    except Exception as e:
+        print(f"Error checking symptom status: {e}")
+        return '✅ Symptoms recorded successfully.'
+    
+    # Case 6: First real symptoms (no previous ones)
+    if not latest_symptom_date:
+        return '✅ First symptoms recorded. Keep tracking for better insights!'
+    
+    # Case 3: Backdated symptoms added after newer ones (out of order)
+    if latest_symptom_date and symptom_date_converted < latest_symptom_date:
+        return '⚠️ **Older symptoms added later.** Timeline kept unchanged. Try recording symptoms in order for better insights.'
+    
+    # Case 4: Backdated symptoms uploaded after report entry
+    if latest_report_date and symptom_date_converted < latest_report_date:
+        return f'⚠️ **Symptoms from {symptom_date_converted.strftime("%d %b %Y")} belong before report entry but recorded later.** Add symptoms early to match reports correctly.'
+    
+    # Case 2: Backdated symptoms (older than 7 days)
+    days_difference = (current_date - symptom_date_converted).days
+    if days_difference > 7:
+        return f'⚠️ **Symptoms from {symptom_date_converted.strftime("%d %b %Y")} added as past data.** Record symptoms soon after you experience them for accurate tracking.'
+    
+    # Case 1: Normal case
+    return '✅ Symptoms recorded successfully.'
+
+
+
 def handle_new_user_name_age_input(name_age_text):
     """Handle name/age input for new users after primary insight - FIXED VERSION"""
     add_message("user", name_age_text)
@@ -4550,7 +5180,15 @@ def handle_new_user_name_age_input(name_age_text):
             elif input_type == "📄 Upload Report" or input_type == "Both":
                 # For Both and Report, save report and symptoms
                 report_data = input_data
-                report = save_medical_report(new_member['id'], report_data["report_text"],report_data.get("report_date"))
+                report_date = report_data.get("report_date") if report_data.get("report_date") else datetime.now().date()
+                extracted_date = report_data.get("report_date")  # This is the extracted date
+
+                report = save_medical_report(new_member['id'], report_data["report_text"], report_date)
+
+                # ✅ NEW: Check and show status message
+                if report:
+                    status_message = check_report_upload_status(new_member['id'], report_date, extracted_date)
+                    add_message("assistant", status_message)
                 
                 # Save symptoms
                 save_symptoms(new_member['id'], report_data["symptoms_text"])
@@ -4674,7 +5312,7 @@ def handle_user_input(user_input):
         process_new_user_symptom_input(user_input)
     
     elif st.session_state.bot_state == "awaiting_name_age":
-        handle_name_age_input(user_input)
+        handle_name_age_input_with_limits(user_input)
     
     elif st.session_state.bot_state == "awaiting_name_age_new_user":
         handle_new_user_name_age_input(user_input)
@@ -4916,7 +5554,7 @@ def render_phone_or_create_profile():
             
             with st.form("create_family", clear_on_submit=False):
                 head_name = st.text_input("Your Name", placeholder="Enter your name")
-                #region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
+                # region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
                 
                 col_create, col_back = st.columns(2)
                 with col_create:
@@ -5282,7 +5920,8 @@ def main():
             if st.session_state.current_profiles:
                 with st.sidebar:    
                     st.subheader("👥 Family Profiles")
-
+                    display_usage_status()
+                    check_and_show_limit_reset()
                     # Different colors for different family members
                     colors = ["#e6f3ff", "#fff0e6", "#e6ffe6", "#f0e6ff", "#fffae6"]
 
@@ -5337,7 +5976,6 @@ def main():
                     </div>
                     """
                         st.markdown(card_html, unsafe_allow_html=True)
-                        
                         # Download button integrated within the card area
                         if st.button("📥 Download Timeline", 
                                    key=f"download_{profile['id']}", 
