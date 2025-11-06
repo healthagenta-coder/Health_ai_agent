@@ -116,7 +116,7 @@ def init_db():
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-
+  
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS usage_tracking (
                         id SERIAL PRIMARY KEY,
@@ -222,6 +222,16 @@ def init_db():
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS member_flags (
+                        id SERIAL PRIMARY KEY,
+                        member_id INTEGER REFERENCES family_members(id) ON DELETE CASCADE,
+                        flag_type VARCHAR(50) NOT NULL,
+                        flag_value VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(member_id, flag_type)
+                    )
+                """)
                 
                 conn.commit()
         except Exception as e:
@@ -259,6 +269,8 @@ def init_session_state():
         "consent_given": False,
         "show_consent_modal": False,  # ADD THIS LINE
         "pending_both": False,
+        "previous_flow": None,  # For the track of sysmptoms first
+        "symptoms_first_triggered": False,  # NEW: More specific flag
     }
     
     for key, value in defaults.items():
@@ -449,29 +461,61 @@ def increment_interaction_count(family_id):
         conn.rollback()
         return 0
 
-def process_uploaded_report_with_validation(uploaded_file):
-    """Process uploaded report with file size validation"""
-    # Validate file size first
-    is_valid, error_message = validate_file_size(uploaded_file, max_size_mb=5)
+def process_uploaded_report(uploaded_file):
+    """Process uploaded report for returning users with duplicate detection and profile validation"""
+    add_message("user", f"Uploaded: {uploaded_file.name}")
     
-    if not is_valid:
-        add_message("user", f"Attempted to upload: {uploaded_file.name}")
-        add_message("assistant", 
-                   f"❌ **File Too Large**\n\n"
-                   f"{error_message}\n\n"
-                   "**Tips to reduce file size:**\n"
-                   "- Compress the PDF using online tools\n"
-                   "- Remove unnecessary pages\n"
-                   "- Reduce image quality in the PDF",
-                   ["📄 Try Another File", "🤒 Check Symptoms"])
+    profile = st.session_state.temp_profile
+    
+    # Extract text from PDF
+    with st.spinner("Processing report..."):
+        report_text = extract_text_from_pdf(uploaded_file)
+    
+    if not report_text:
+        add_message("assistant", "❌ Could not read the PDF file. Please try another file.", 
+           ["📄 Upload Report", "🤒 Check Symptoms", "Both"])
         st.session_state.bot_state = "welcome"
-        if 'last_processed_file' in st.session_state:
-            del st.session_state.last_processed_file
-        return False
+        return
     
-    # Continue with normal processing
-    process_uploaded_report(uploaded_file)
-    return True
+    # ✅ SIMPLIFIED: Validate report belongs to current profile
+    validation_result, extracted_name, extracted_date = validate_report_for_profile(report_text, profile)
+    
+    if validation_result == "wrong_profile":
+        # Show only the message, no buttons
+        warning_msg = "⚠️ **This report seems to belong to another profile.**\n\n"
+        warning_msg += "**Please reset chat and upload it in the correct profile or create a new one.**"
+        
+        add_message("assistant", warning_msg, ["🔄 Reset Chat"])
+        st.session_state.bot_state = "welcome"
+        return
+    
+    elif validation_result == "missing_both":
+        # Show only the message for missing name and date
+        warning_msg = "⚠️ **This report is missing name or date.**"
+        
+        add_message("assistant", warning_msg, ["📄 Upload Report", "🤒 Check Symptoms", "Both"])
+        st.session_state.bot_state = "welcome"
+        return
+    
+    # ✅ Continue with duplicate check for valid reports
+    is_duplicate, similarity, existing_date = check_duplicate_report(profile['id'], report_text)
+    
+    if is_duplicate:
+        warning_msg = f"⚠️ **Duplicate Report Detected**\n\n"
+        warning_msg += f"This report appears to be {similarity}% similar to a report already uploaded"
+        if existing_date:
+            warning_msg += f" on {existing_date}"
+        warning_msg += ".\n\n**Do you want to proceed anyway?**"
+        
+        add_message("assistant", warning_msg, 
+                   ["✅ Yes, Upload Anyway", "❌ Cancel Upload"])
+        st.session_state.bot_state = "awaiting_duplicate_confirmation"
+        st.session_state.temp_report_text = report_text
+        return
+    else:
+        # ✅ If NOT duplicate and valid, continue processing
+        print(f"✅ Report validated for {profile['name']}, proceeding with processing")
+        process_report_after_duplicate_check(profile, report_text)
 
 def handle_name_age_input_with_limits(name_age_text):
     """Handle name/age input with family member limit check"""
@@ -1460,7 +1504,8 @@ def check_previous_insights_exist(member_id):
 def get_gemini_report_insight(report_text, symptoms_text, member_data=None, region=None, member_id=None, report_id=None):
     """Get medical report analysis with structured data storage and sequential context - FIXED VERSION"""
     print(f"🔍 DEBUG: Starting Gemini insight generation for member {member_id}, report {report_id}")
-    
+    print(f"🔍 DEBUG: symptoms_first_triggered at START = {getattr(st.session_state, 'symptoms_first_triggered', 'NOT SET')}")
+
     if not GEMINI_AVAILABLE:
         print("❌ DEBUG: Gemini not available")
         if symptoms_text.lower() != "no symptoms reported - routine checkup":
@@ -1626,7 +1671,7 @@ Return ONLY valid JSON in the following format:
 """
         
         elif insight_type == "sequential":
-            # Build temporal context with actual dates
+    # Build temporal context with actual dates
             previous_reports_context = ""
             if current_sequence > 1 and member_id:
                 previous_reports = get_previous_reports_for_sequence(member_id, current_sequence, current_cycle, 2)
@@ -1662,12 +1707,52 @@ Return ONLY valid JSON in the following format:
             
             current_date_str = current_report_date.strftime('%Y-%m-%d')
             
-            prompt = f"""
-        You are a medical AI assistant analyzing patient health reports over time with DATE-AWARE temporal correlation.
+            # ✅ CHECK FLOW: Use helper function
+            if should_remove_change_since_last(member_id):
+                # Symptoms first → Remove "Change Since Last"
+                print("🔄 DEBUG: Using symptoms-first format (no Change Since Last)")
+                prompt = f"""
+        You are a medical AI assistant analyzing patient health reports over time.
 
-        CRITICAL: This report is dated {current_date_str}. Compare findings against previous reports with their specific dates.
+        CRITICAL: This report follows recent symptom analysis. Focus on integrating the report findings with the previously discussed symptoms.
 
-        TEMPORAL CONTEXT — PREVIOUS REPORTS WITH DATES:
+        TEMPORAL CONTEXT — PREVIOUS REPORTS Donot include Dates:
+        {previous_reports_context}
+
+        PATIENT INFORMATION:
+        {member_info}
+
+        CURRENT REPORTED SYMPTOMS (recently discussed):
+        {symptoms_text}
+
+        CURRENT MEDICAL REPORT (Dated {current_date_str}):
+        {report_text}
+
+        ANALYSIS GUIDELINES:
+        - Focus on NEW findings in the current report compared to previous reports
+        - Integrate these findings with the recently discussed symptoms
+        - Provide updated clinical assessment based on current findings
+        - Do NOT include "change since last" or temporal progression analysis
+        - Keep the output medically structured and concise
+
+        Return ONLY valid JSON in the following format:
+
+        {{
+        "new_findings": "List new lab or clinical findings in the report not seen in previous reports",
+        "updated_diagnosis": "Updated clinical impression or working diagnosis based on new findings",
+        "clinical_implications": "Explain what the new findings indicate about the patient's condition",
+        "recommended_next_step": "Specific recommended actions based on current findings"
+        }}
+        """
+            else:
+                # Normal flow → Keep "Change Since Last"
+                print("🔄 DEBUG: Using normal format (with Change Since Last)")
+                prompt = f"""
+        You are a medical AI assistant analyzing patient health reports over time with temporal correlation.
+
+        CRITICAL: This report is dated {current_date_str}. Compare findings against previous reports.
+
+        TEMPORAL CONTEXT — PREVIOUS REPORTS Donot Include Dates:
         {previous_reports_context}
 
         PATIENT INFORMATION:
@@ -1680,8 +1765,7 @@ Return ONLY valid JSON in the following format:
         {report_text}
 
         ANALYSIS GUIDELINES:
-        - Compare SPECIFIC findings between the dated reports
-        - Calculate approximate time elapsed between current and previous reports
+        - Compare SPECIFIC findings
         - Note if findings are consistent with natural disease progression given the time period
         - Identify NEW findings not present in previous reports
         - Keep the output medically structured and concise
@@ -1690,13 +1774,14 @@ Return ONLY valid JSON in the following format:
         Return ONLY valid JSON in the following format:
 
         {{
-        "new_findings": "List new lab or clinical findings in the {current_date_str} report not seen in previous reports",
-        "change_since_last": "Describe temporal progression - include approximate time elapsed and specify if Improving, Worsening, or Stable",
+        "new_findings": "List new lab or clinical findings in the report not seen in previous reports",
+        "change_since_last": "Describe temporal progression -  specify if Improving, Worsening, or Stable aslo Provide a concise clinical description of how the condition has progressed in one clear sentence and Do not include any dates",
         "updated_diagnosis": "Current clinical impression integrating temporal progression and new findings",
         "clinical_implications": "Explain what the temporal pattern indicates about disease progression or recovery",
         "recommended_next_step": "Specific recommended actions based on temporal trend"
         }}
         """
+        
         
         else:  # predictive insight
             prompt = f"""
@@ -1809,7 +1894,26 @@ IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
 """
         
         elif insight_type == "sequential":
-            insight_text = f"""
+    # ✅ CHECK FLOW: Use helper function
+            if should_remove_change_since_last(member_id):
+                print("🔄 DEBUG: Displaying symptoms-first format")
+                insight_text = f"""
+## 🔍 Sequential Insight (Report #{current_sequence})
+
+**🆕 New Findings:** {insight_json.get('new_findings', 'Not specified')}
+
+**🩺 Updated Diagnosis:** {insight_json.get('updated_diagnosis', 'Not specified')}
+
+**🔬 Clinical Implications:** {insight_json.get('clinical_implications', 'Not specified')}
+
+**🚨 Recommended Next Step:** {insight_json.get('recommended_next_step', 'Not specified')}
+
+> 💡 **Sequential Insight:**  
+> Upload more data to gain deeper and more comprehensive insights.
+"""
+            else:
+                print("🔄 DEBUG: Displaying normal format")
+                insight_text = f"""
 ## 🔍 Sequential Insight (Report #{current_sequence})
 
 **🆕 New Findings:** {insight_json.get('new_findings', 'Not specified')}
@@ -2971,6 +3075,55 @@ def extract_key_findings_from_cycle(insights):
     else:
         return "Routine monitoring with no critical findings identified."
 
+# helper function for the change since last 
+
+def set_symptoms_first_in_db(member_id):
+    """Store symptoms first flag in database"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO member_flags (member_id, flag_type, flag_value, created_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (member_id, flag_type) 
+                DO UPDATE SET flag_value = EXCLUDED.flag_value, created_at = NOW()
+            """, (member_id, 'symptoms_first', 'true'))
+            conn.commit()
+            print(f"✅ DEBUG: Set symptoms_first flag in DB for member {member_id}")
+    except Exception as e:
+        print(f"Error setting symptoms first flag: {e}")
+
+def check_symptoms_first_from_db(member_id):
+    """Check if symptoms first flag exists in database (within last 1 hour)"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT flag_value, created_at FROM member_flags 
+                WHERE member_id = %s AND flag_type = %s
+                AND created_at > NOW() - INTERVAL '1 hour'
+            """, (member_id, 'symptoms_first'))
+            result = cur.fetchone()
+            if result and result['flag_value'] == 'true':
+                print(f"✅ DEBUG: Found valid symptoms_first flag in DB for member {member_id}")
+                return True
+            else:
+                print(f"❌ DEBUG: No valid symptoms_first flag found in DB for member {member_id}")
+                return False
+    except Exception as e:
+        print(f"Error checking symptoms first flag: {e}")
+        return False
+
+def clear_symptoms_first_from_db(member_id):
+    """Clear symptoms first flag from database"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM member_flags 
+                WHERE member_id = %s AND flag_type = %s
+            """, (member_id, 'symptoms_first'))
+            conn.commit()
+            print(f"✅ DEBUG: Cleared symptoms_first flag from DB for member {member_id}")
+    except Exception as e:
+        print(f"Error clearing symptoms first flag: {e}")
 
 def get_archived_cycles_context(member_id, current_cycle, limit=2):
     """Get context from previous archived cycles"""
@@ -3153,7 +3306,117 @@ def create_family_member(family_id, name, age, sex='Other'):
         conn.rollback()
         st.error(f"Error creating family member: {e}")
         return None
+
+def extract_patient_info_from_report(report_text):
+    """Extract patient name and date from report text using Gemini - IMPROVED"""
+    if not GEMINI_AVAILABLE or not report_text:
+        return None, None
     
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        prompt = f"""
+        Extract the patient name and report date from this medical report. 
+        
+        IMPORTANT: 
+        - Return "null" for patient_name if no clear patient name is found
+        - Return "null" for report_date if no clear date is found  
+        - Look for patterns like "Patient:", "Name:", "MRN:", etc.
+        - For dates, look for formats like DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD
+        
+        Return ONLY a JSON object with this exact format:
+        {{
+          "patient_name": "extracted name or null",
+          "report_date": "extracted date in YYYY-MM-DD format or null"
+        }}
+        
+        MEDICAL REPORT TEXT:
+        {report_text[:3000]}
+        """
+        
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Clean response
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in response_text:
+            response_text = response_text.split('```')[1].split('```')[0].strip()
+        
+        # Parse JSON
+        try:
+            extracted_data = json.loads(response_text)
+            patient_name = extracted_data.get('patient_name')
+            report_date = extracted_data.get('report_date')
+            
+            # Convert "null" string to None
+            if patient_name and patient_name.lower() == 'null':
+                patient_name = None
+            if report_date and report_date.lower() == 'null':
+                report_date = None
+                
+            # Clean patient name if present
+            if patient_name:
+                # Remove common prefixes and clean up
+                patient_name = re.sub(r'^(patient|name|mr|ms|mrs|dr)[:\s]*', '', patient_name, flags=re.IGNORECASE).strip()
+                # If after cleaning it's empty, set to None
+                if not patient_name:
+                    patient_name = None
+                    
+            return patient_name, report_date
+            
+        except json.JSONDecodeError:
+            print("❌ JSON parsing failed in extract_patient_info_from_report")
+            return None, None
+            
+    except Exception as e:
+        print(f"Error extracting patient info: {e}")
+        return None, None
+
+def check_name_similarity(name1, name2):
+    """Check if two names are similar using fuzzy matching"""
+    if not name1 or not name2:
+        return False
+    
+    # Convert to lowercase and remove extra spaces
+    name1_clean = re.sub(r'\s+', ' ', name1.lower().strip())
+    name2_clean = re.sub(r'\s+', ' ', name2.lower().strip())
+    
+    # Exact match
+    if name1_clean == name2_clean:
+        return True
+    
+    # Fuzzy matching with high threshold
+    similarity = fuzz.ratio(name1_clean, name2_clean)
+    return similarity >= 50  # 80% similarity threshold
+
+def validate_report_for_profile(report_text, current_profile):
+    """Validate if the report belongs to the current profile - FIXED LOGIC"""
+    extracted_name, extracted_date = extract_patient_info_from_report(report_text)
+    
+    print(f"🔍 DEBUG: Extracted name: '{extracted_name}', Date: '{extracted_date}'")
+    print(f"🔍 DEBUG: Current profile: '{current_profile['name']}'")
+    
+    # Check if we couldn't extract any info (both None)
+    if extracted_name is None and extracted_date is None:
+        return "missing_both", None, None
+    
+    # Check if name is missing (but date might be present)
+    if extracted_name is None:
+        return "missing_name", None, extracted_date
+    
+    # Check if date is missing (but name might be present)
+    if extracted_date is None:
+        return "missing_date", extracted_name, None
+    
+    # Now check if name matches current profile (only if we have a name)
+    current_profile_name = current_profile['name']
+    if not check_name_similarity(extracted_name, current_profile_name):
+        return "wrong_profile", extracted_name, extracted_date
+    
+    return "valid", extracted_name, extracted_date
+
+
 def save_symptoms(member_id, symptoms_text, severity=None, reported_date=None):
     """Save symptoms with special handling for carried forward and custom dates"""
     try:
@@ -3311,6 +3574,11 @@ def process_new_user_symptom_input(symptoms_text):
     """Process symptoms for new users (before profile creation) - FIXED VERSION"""
     print(f"🔍 DEBUG: Processing new user symptom input: {symptoms_text}")
     add_message("user", symptoms_text)
+    
+    # ✅ SET THE FLAG FOR NEW USER FLOW TOO
+    st.session_state.symptoms_first_triggered = True
+    st.session_state.new_user_symptoms_first = True 
+    print(f"✅✅✅ DEBUG: symptoms_first_triggered SET TO TRUE in process_new_user_symptom_input")
     
     # Store the symptoms for later profile creation
     st.session_state.new_user_input_data = symptoms_text
@@ -3991,6 +4259,15 @@ def process_symptom_input(symptoms_text):
     
     add_message("user", symptoms_text)
     
+    st.session_state.previous_flow = "symptoms_first"
+    st.session_state.symptoms_first_triggered = True
+    if hasattr(st.session_state, 'temp_profile'):
+        set_symptoms_first_in_db(st.session_state.temp_profile['id'])
+    print(f"✅✅✅ DEBUG: symptoms_first_triggered SET TO TRUE in process_symptom_input")
+    
+    print(f"✅ DEBUG: Set symptoms_first_triggered = True")
+    print(f"✅✅✅ DEBUG: Current state - symptoms_first_triggered = {st.session_state.symptoms_first_triggered}")
+
     profile = st.session_state.temp_profile
 
     status_message = check_symptom_upload_status(profile['id'], symptoms_text)
@@ -4087,6 +4364,23 @@ def process_symptom_input(symptoms_text):
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_more_input"
     print(f"✅ DEBUG: Symptom processing COMPLETED for {profile['name']}")
+
+def should_remove_change_since_last(member_id=None):
+    """Check if we should remove 'Change Since Last' from insights - DATABASE APPROACH"""
+    # Check session state first (for current session)
+    session_flag = getattr(st.session_state, 'symptoms_first_triggered', False)
+    
+    # Check database if member_id provided (for page refreshes)
+    db_flag = False
+    if member_id:
+        db_flag = check_symptoms_first_from_db(member_id)
+    
+    should_remove = session_flag or db_flag
+    
+    print(f"🔍🔍🔍 DEBUG: should_remove_change_since_last = {should_remove}")
+    print(f"🔍🔍🔍 DEBUG: Session flag = {session_flag}, DB flag = {db_flag}, Member ID = {member_id}")
+    
+    return should_remove
 
 def handle_add_to_timeline():
     """Handle adding symptoms to timeline - ask who it's for"""
@@ -4529,6 +4823,14 @@ def process_report_directly(profile, report_text):
             report['id'] if report else None
         )
     
+    # ✅ RESET THE FLAG IN BOTH SESSION STATE AND DATABASE
+    if hasattr(st.session_state, 'symptoms_first_triggered'):
+        st.session_state.symptoms_first_triggered = False
+        print(f"🔄 DEBUG: Reset symptoms_first_triggered in session state")
+    
+    # Clear from database
+    clear_symptoms_first_from_db(profile['id'])
+    
     # Extract just the insight text from the tuple
     if isinstance(insight_result, tuple) and len(insight_result) >= 1:
         insight_text = insight_result[0]
@@ -4540,7 +4842,7 @@ def process_report_directly(profile, report_text):
         current_cycle = 1
         current_sequence = 1
         days_in_cycle = 0
-    
+        
     # Save insight
     if insight_text and report:
         insight_text_clean = insight_text.replace("🔍 Primary Insight:", "").replace("🔍 Sequential Insight:", "").replace("🔮 Predictive Insight:", "").replace(f"🔄 New Cycle #{current_cycle} Started", "").strip()
@@ -4564,10 +4866,16 @@ def process_report_directly(profile, report_text):
     buttons = ["📄 Add Another Report", "🤒 Add Symptoms", "Both", "✅ Finish & Save Timeline"]
     add_message("assistant", response, buttons)
     st.session_state.bot_state = "awaiting_more_input"
+
+    if hasattr(st.session_state, 'symptoms_first_triggered'):
+        print(f"🔄 DEBUG: Resetting symptoms_first_triggered flag")
+        st.session_state.symptoms_first_triggered = False
+        st.session_state.previous_flow = None
+
     print("✅ Report processing completed successfully")
 
 def process_uploaded_report(uploaded_file):
-    """Process uploaded report for returning users with duplicate detection"""
+    """Process uploaded report for returning users with duplicate detection and profile validation"""
     add_message("user", f"Uploaded: {uploaded_file.name}")
     
     profile = st.session_state.temp_profile
@@ -4582,7 +4890,61 @@ def process_uploaded_report(uploaded_file):
         st.session_state.bot_state = "welcome"
         return
     
-    # ✅ Check for duplicate
+    # ✅ Validate report belongs to current profile
+    validation_result, extracted_name, extracted_date = validate_report_for_profile(report_text, profile)
+    
+    if validation_result == "wrong_profile":
+        warning_msg = f"⚠️ **Report Belongs to Different Profile**\n\n"
+        warning_msg += f"This report appears to belong to **{extracted_name}**, but you're uploading it to **{profile['name']}'s** profile.\n\n"
+        warning_msg += "**Please:**\n"
+        warning_msg += "1. Reset the chat\n"
+        warning_msg += "2. Select the correct profile or create a new one\n"
+        warning_msg += "3. Upload the report again"
+        
+        add_message("assistant", warning_msg, 
+                   ["🔄 Reset Chat & Upload Correctly", "❌ Cancel Upload"])
+        st.session_state.bot_state = "awaiting_wrong_profile_confirmation"
+        st.session_state.temp_report_text = report_text
+        st.session_state.extracted_patient_name = extracted_name
+        return
+    
+    elif validation_result == "missing_both":
+        warning_msg = f"⚠️ **Report Missing Name and Date**\n\n"
+        warning_msg += "This report doesn't contain a patient name or date.\n\n"
+        warning_msg += "**Please upload a complete medical report with:**\n"
+        warning_msg += "- Patient name\n"
+        warning_msg += "- Report date\n"
+        warning_msg += "- Clinical findings"
+        
+        add_message("assistant", warning_msg, 
+                   ["✅ Upload Anyway", "❌ Cancel Upload"])
+        st.session_state.bot_state = "awaiting_incomplete_report_confirmation"
+        st.session_state.temp_report_text = report_text
+        return
+    
+    elif validation_result == "missing_name":
+        warning_msg = f"⚠️ **Report Missing Patient Name**\n\n"
+        warning_msg += "This report doesn't contain a patient name.\n\n"
+        warning_msg += "**Please ensure future reports include the patient name for accurate tracking.**"
+        
+        add_message("assistant", warning_msg, 
+                   ["✅ Upload Anyway", "❌ Cancel Upload"])
+        st.session_state.bot_state = "awaiting_incomplete_report_confirmation"
+        st.session_state.temp_report_text = report_text
+        return
+    
+    elif validation_result == "missing_date":
+        warning_msg = f"⚠️ **Report Missing Date**\n\n"
+        warning_msg += "This report doesn't contain a date.\n\n"
+        warning_msg += "**Please ensure future reports include the date for accurate timeline tracking.**"
+        
+        add_message("assistant", warning_msg, 
+                   ["✅ Upload Anyway", "❌ Cancel Upload"])
+        st.session_state.bot_state = "awaiting_incomplete_report_confirmation"
+        st.session_state.temp_report_text = report_text
+        return
+    
+    # ✅ Continue with duplicate check for valid reports
     is_duplicate, similarity, existing_date = check_duplicate_report(profile['id'], report_text)
     
     if is_duplicate:
@@ -4595,12 +4957,13 @@ def process_uploaded_report(uploaded_file):
         add_message("assistant", warning_msg, 
                    ["✅ Yes, Upload Anyway", "❌ Cancel Upload"])
         st.session_state.bot_state = "awaiting_duplicate_confirmation"
-        st.session_state.temp_report_text = report_text  # Store for later
+        st.session_state.temp_report_text = report_text
         return
     else:
-        # ✅ NEW: If NOT duplicate, continue processing immediately
-        print(f"✅ No duplicate detected, proceeding with report processing for {profile['name']}")
+        # ✅ If NOT duplicate and valid, continue processing
+        print(f"✅ Report validated for {profile['name']}, proceeding with processing")
         process_report_after_duplicate_check(profile, report_text)
+
 
 def process_report_after_duplicate_check(profile, report_text):
     """Continue report processing after duplicate check"""
@@ -5015,6 +5378,8 @@ def handle_chat_button(button_text):
                 process_health_input_for_profile(profile)
                 break
 
+
+
 def convert_to_date(date_value):
     """
     Convert various date formats to date object - ENHANCED VERSION
@@ -5110,16 +5475,34 @@ def check_symptom_upload_status(member_id, symptoms_text, symptom_date=None):
     # Case 1: Normal case
     return '✅ Symptoms recorded successfully.'
 
+# Add this temporarily to see the full state
+def debug_session_state():
+    print("=== DEBUG SESSION STATE ===")
+    print(f"symptoms_first_triggered: {getattr(st.session_state, 'symptoms_first_triggered', 'NOT SET')}")
+    print(f"previous_flow: {getattr(st.session_state, 'previous_flow', 'NOT SET')}")
+    print("===========================")
 
+# Call this in key places to see what's happening
 
 def handle_new_user_name_age_input(name_age_text):
     """Handle name/age input for new users after primary insight - FIXED VERSION"""
     add_message("user", name_age_text)
     
+    print(f"🔍🔍🔍 DEBUG: At START of handle_new_user_name_age_input:")
+    print(f"🔍🔍🔍 DEBUG: symptoms_first_triggered = {getattr(st.session_state, 'symptoms_first_triggered', 'NOT SET')}")
+    print(f"🔍🔍🔍 DEBUG: new_user_symptoms_first = {getattr(st.session_state, 'new_user_symptoms_first', 'NOT SET')}")
+
     # Parse name, age, and gender
     name, age, sex = parse_name_age_sex(name_age_text)
     relationship = st.session_state.pending_relationship
     
+    # symptoms_first_flag = getattr(st.session_state, 'symptoms_first_triggered', False)
+    # print(f"🔍 DEBUG: Preserving symptoms_first_triggered = {symptoms_first_flag}")
+
+    # if getattr(st.session_state, 'new_user_symptoms_first', False):
+    #     st.session_state.symptoms_first_triggered = True
+    #     print(f"✅✅✅ DEBUG: Restored symptoms_first_triggered from backup flag")
+
     # Create the family member
     if st.session_state.current_family:
         new_member = create_family_member(st.session_state.current_family['id'], name, age, sex)
@@ -5128,6 +5511,11 @@ def handle_new_user_name_age_input(name_age_text):
             st.session_state.current_profiles.append(new_member)
             
             print(f"✅ DEBUG: Created new member {name} with ID: {new_member['id']}")
+            
+            # ✅ SET THE FLAG IN DATABASE FOR NEW USER FLOW
+            if getattr(st.session_state, 'new_user_symptoms_first', False):
+                set_symptoms_first_in_db(new_member['id'])
+                print(f"✅✅✅ DEBUG: Set symptoms_first flag in DB for new member {new_member['id']}")
             
             # Now save the stored input data to the new profile
             input_type = st.session_state.new_user_input_type
@@ -5302,13 +5690,13 @@ def handle_user_input(user_input):
     print(f"🔍 DEBUG: User input received in state: {st.session_state.bot_state}")
     print(f"🔍 DEBUG: Input: {user_input}")
     
+    # Handle specific states
     if st.session_state.bot_state == "awaiting_symptom_input":
         print("🔍 DEBUG: Processing symptom input - CALLING process_symptom_input")
         process_symptom_input(user_input)
     
     elif st.session_state.bot_state == "awaiting_symptom_input_new_user":
         print("🔍 DEBUG: Processing new user symptom input")
-        process_new_user_symptom_input(user_input)
         process_new_user_symptom_input(user_input)
     
     elif st.session_state.bot_state == "awaiting_name_age":
@@ -5329,41 +5717,131 @@ def handle_user_input(user_input):
     elif st.session_state.bot_state == "awaiting_symptoms_for_both_returning":
         handle_symptoms_for_both_returning(user_input)
     
-    # ✅ NEW: Add this case
-    elif st.session_state.bot_state == "awaiting_duplicate_confirmation":
-        add_message("user", user_input)
-        add_message("assistant", "Please use the buttons above to confirm or cancel")
-    
-    elif st.session_state.bot_state == "awaiting_input_type":
-        if user_input.lower() in ["symptoms", "check symptoms", "symptom"]:
-            handle_input_type_selection("🤒 Check Symptoms")
-        elif user_input.lower() in ["report", "upload report", "upload"]:
-            handle_input_type_selection("📄 Upload Report")
-        elif user_input.lower() in ["both", "symptoms and report"]:
-            handle_input_type_selection("Both")
-        # else:
-        #     add_message("assistant", "Please choose one of the options above or type: 'Symptoms', 'Report', or 'Both'")
-    
-    elif st.session_state.bot_state == "awaiting_profile_selection":
-        add_message("user", user_input)
-        add_message("assistant", "Please use the buttons above to select a profile")
-    
-    elif st.session_state.bot_state == "awaiting_post_insight_profile":
-        add_message("user", user_input)
-        add_message("assistant", "Please use the buttons above to select who this is for")
-    
-    elif st.session_state.bot_state == "awaiting_more_input":
-        if user_input.lower() in ["add report", "report", "upload"]:
-            handle_more_input_selection("📄 Add Report")
-        elif user_input.lower() in ["add symptoms", "symptoms", "more symptoms"]:
-            handle_more_input_selection("🤒 Add Symptoms")
-        elif user_input.lower() in ["finish", "done", "save"]:
-            handle_more_input_selection("✅ Finish & Save Timeline")
+    # ✅ NEW: Handle random messages in any state
+    elif st.session_state.bot_state in ["welcome", "awaiting_input_type", "awaiting_more_input"]:
+        # Check if input matches any known commands
+        if is_known_command(user_input):
+            # If it's a known command, process it
+            process_known_command(user_input)
         else:
-            add_message("assistant", "Please use the buttons above or type: 'Add Report', 'Add Symptoms', or 'Finish'")
+            # If it's a random message, show input type selection
+            handle_random_message(user_input)
     
+    # ✅ NEW: Handle random messages in other states too
     else:
-        handle_welcome()
+        if is_known_command(user_input):
+            process_known_command(user_input)
+        else:
+            handle_random_message(user_input)
+
+def is_known_command(user_input):
+    """Check if the user input matches any known commands"""
+    known_commands = [
+        'symptoms', 'symptom', 'check symptoms', 'check symptom', 
+        'report', 'upload', 'upload report', 'medical report',
+        'both', 'symptoms and report', 'report and symptoms',
+        'help', 'what can you do', 'options', 'menu'
+    ]
+    
+    user_input_lower = user_input.lower().strip()
+    
+    # Check for exact matches or contains known keywords
+    for command in known_commands:
+        if (user_input_lower == command or 
+            command in user_input_lower or 
+            any(word in user_input_lower for word in command.split())):
+            return True
+    
+    return False
+
+def process_known_command(user_input):
+    """Process known commands and route to appropriate handlers"""
+    user_input_lower = user_input.lower().strip()
+    
+    if any(word in user_input_lower for word in ['symptom', 'check symptom']):
+        handle_input_type_selection("🤒 Check Symptoms")
+    elif any(word in user_input_lower for word in ['report', 'upload']):
+        handle_input_type_selection("📄 Upload Report")
+    elif any(word in user_input_lower for word in ['both', 'and']):
+        handle_input_type_selection("Both")
+    elif any(word in user_input_lower for word in ['help', 'what can you do', 'options', 'menu']):
+        show_help_message()
+    else:
+        # Fallback to showing input options
+        handle_random_message(user_input)
+
+def handle_random_message(user_input):
+    """Handle random/unrecognized messages by showing input options"""
+    add_message("user", user_input)
+    
+    if st.session_state.current_profiles:
+        # Returning user with existing profiles
+        response = f"""
+I'm not sure what you meant by "{user_input}".
+
+### What would you like to do today?
+"""
+        buttons = ["🤒 Check Symptoms", "📄 Upload Report", "Both"]
+    else:
+        # First-time user
+        response = f"""
+I'm not sure what you meant by "{user_input}".
+
+### Let's get started with your health journey!
+"""
+        buttons = ["🤒 Check Symptoms", "📄 Upload Report", "Both"]
+    
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_input_type"
+
+def show_help_message():
+    """Show help message with available options"""
+    add_message("user", "help")
+    
+    if st.session_state.current_profiles:
+        response = """
+### 🤖 How I can help you:
+
+**📋 Available Options:**
+- **🤒 Check Symptoms**: Describe your symptoms for analysis
+- **📄 Upload Report**: Upload medical reports (PDF format)  
+- **Both**: Upload report AND describe symptoms together
+
+**💡 Examples:**
+- "I have fever and headache" → Check Symptoms
+- "Upload my blood test" → Upload Report  
+- "I want to add both symptoms and report" → Both
+
+**🔄 You can also:**
+- Reset chat anytime using the 🔄 button
+- View your health timeline for any profile
+- Download PDF reports of your health history
+"""
+    else:
+        response = """
+### 🤖 Welcome! Here's how I can help:
+
+**🚀 Get Started With:**
+- **🤒 Check Symptoms**: Describe health issues for immediate analysis
+- **📄 Upload Report**: Upload medical documents for detailed insights
+- **Both**: Combine symptoms and reports for comprehensive analysis
+
+**📝 Just type or click:**
+- "I'm feeling unwell" → Check Symptoms
+- "I have a medical report" → Upload Report
+- "I want to do both" → Both
+
+**🎯 After starting, I'll help you:**
+- Create family profiles
+- Generate health insights  
+- Track your medical timeline
+- Provide actionable recommendations
+"""
+    
+    buttons = ["🤒 Check Symptoms", "📄 Upload Report", "Both"]
+    add_message("assistant", response, buttons)
+    st.session_state.bot_state = "awaiting_input_type"
+
 
 def render_profile_completion(member_id, member_name):
     """Render profile completion form for habits and health metrics"""
