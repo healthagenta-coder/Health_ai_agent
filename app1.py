@@ -4902,7 +4902,7 @@ def process_uploaded_report(uploaded_file):
         warning_msg += "3. Upload the report again"
         
         add_message("assistant", warning_msg, 
-                   ["🔄 Reset Chat & Upload Correctly", "❌ Cancel Upload"])
+                   ["❌ Cancel Upload"])
         st.session_state.bot_state = "awaiting_wrong_profile_confirmation"
         st.session_state.temp_report_text = report_text
         st.session_state.extracted_patient_name = extracted_name
@@ -6482,3 +6482,4 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
