@@ -42,11 +42,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-          host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -2742,8 +2742,9 @@ def archive_current_cycle_simple(member_id, cycle_number):
         conn.rollback()
         return False
 
+
 def archive_current_cycle(member_id, cycle_number):
-    """Archive the current cycle with AI-generated summary - FIXED TO CALL AI FUNCTION"""
+    """Archive the current cycle with AI-generated summary - USING STRUCTURED_INSIGHTS"""
     print(f"🔄 Attempting to archive cycle #{cycle_number} for member {member_id}")
     
     try:
@@ -2763,7 +2764,7 @@ def archive_current_cycle(member_id, cycle_number):
             return False
         
         with conn.cursor() as cur:
-            # Get cycle data - FIX: Use tuple instead of list
+            # Get cycle data
             cycle_query = """
                 SELECT 
                     MIN(created_at) as cycle_start,
@@ -2789,36 +2790,33 @@ def archive_current_cycle(member_id, cycle_number):
             
             print(f"📊 Cycle data: {total_entries} entries, {report_count} reports, {symptom_count} symptoms")
             
-            # Get insights from this cycle - FIX: Use tuple
+            # ✅ CHANGED: Get structured insights from this cycle
             insights_query = """
-                SELECT ih.insight_text, ih.created_at, iseq.sequence_number, iseq.insight_type
-                FROM insight_history ih
-                JOIN insight_sequence iseq ON (
-                    ih.report_id = iseq.report_id 
-                    OR (ih.report_id IS NULL AND iseq.report_id IS NULL AND ih.member_id = iseq.member_id)
-                )
-                WHERE ih.member_id = %s AND iseq.cycle_number = %s
-                ORDER BY iseq.sequence_number
+                SELECT si.insight_data, si.created_at, iseq.sequence_number, iseq.insight_type
+                FROM structured_insights si
+                JOIN insight_sequence iseq ON si.member_id = iseq.member_id AND si.sequence_number = iseq.sequence_number
+                WHERE si.member_id = %s AND iseq.cycle_number = %s
+                ORDER BY iseq.sequence_number DESC LIMIT 3
             """
-            cur.execute(insights_query, (member_id, cycle_number))  # ✅ FIX: Use tuple
+            cur.execute(insights_query, (member_id, cycle_number))
             insights = cur.fetchall()
-            print(f"📝 Found {len(insights)} insights for AI summary")
+            print(f"📝 Found {len(insights)} structured insights for AI summary")
             
-            # Get health scores - FIX: Use tuple
+            # Get health scores
             score_query = """
                 SELECT AVG(final_score) as avg_score
                 FROM health_scores hs
                 JOIN insight_sequence iseq ON hs.report_id = iseq.report_id
                 WHERE hs.member_id = %s AND iseq.cycle_number = %s
             """
-            cur.execute(score_query, (member_id, cycle_number))  # ✅ FIX: Use tuple
+            cur.execute(score_query, (member_id, cycle_number))
             score_result = cur.fetchone()
             avg_score = score_result['avg_score'] if score_result and score_result['avg_score'] is not None else None
             print(f"📈 Average health score: {avg_score}")
             
-            # ✅ FIX: CALL THE AI SUMMARY FUNCTION
-            print("🤖 CALLING generate_cycle_summary_with_ai...")
-            cycle_summary = generate_cycle_summary_with_ai(
+            # ✅ CHANGED: Call the UPDATED AI summary function
+            print("🤖 CALLING generate_cycle_summary_from_structured_data...")
+            cycle_summary = generate_cycle_summary_from_structured_data(
                 member_id, 
                 cycle_number, 
                 insights, 
@@ -2834,11 +2832,11 @@ def archive_current_cycle(member_id, cycle_number):
             
             print(f"📄 AI Summary generated: {len(cycle_summary)} characters")
             
-            # Extract key findings
-            key_findings = extract_key_findings_from_cycle(insights)
+            # Extract key findings from structured data
+            key_findings = extract_key_findings_from_structured_insights(insights)
             print(f"🔑 Key findings extracted: {len(key_findings)} characters")
             
-            # Save to cycle_archives - FIX: Use tuple
+            # Save to cycle_archives
             archive_query = """
                 INSERT INTO cycle_archives 
                 (member_id, cycle_number, cycle_start_date, cycle_end_date, 
@@ -2854,12 +2852,12 @@ def archive_current_cycle(member_id, cycle_number):
                 member_id, cycle_number, cycle_start, cycle_end,
                 report_count, symptom_count, cycle_summary, key_findings,
                 float(avg_score) if avg_score else None
-            )  # ✅ FIX: Use tuple
+            )
             
             cur.execute(archive_query, archive_params)
             conn.commit()
             
-            print(f"✅ SUCCESS: Cycle #{cycle_number} archived with AI summary!")
+            print(f"✅ SUCCESS: Cycle #{cycle_number} archived with structured data summary!")
             print(f"   - AI Summary: {len(cycle_summary)} chars")
             print(f"   - Key Findings: {len(key_findings)} chars")
             
@@ -2872,6 +2870,258 @@ def archive_current_cycle(member_id, cycle_number):
         conn.rollback()
         return False
 
+def generate_cycle_summary_from_structured_data(member_id, cycle_number, structured_insights, cycle_info, avg_score):
+    """Generate comprehensive cycle summary using structured_insights data"""
+    
+    print(f"🤖 generate_cycle_summary_from_structured_data CALLED for cycle #{cycle_number}")
+    print(f"   - Structured insights count: {len(structured_insights)}")
+    print(f"   - Gemini available: {GEMINI_AVAILABLE}")
+    
+    # If no insights or Gemini not available, use simple summary
+    if not structured_insights or not GEMINI_AVAILABLE:
+        print("⚠️ Using simple summary from structured data")
+        return generate_simple_structured_summary(structured_insights, cycle_info, avg_score)
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Build comprehensive context from structured data
+        structured_context = build_structured_context_for_ai(structured_insights, cycle_info)
+        
+        # Get member info for context
+        member_info = ""
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name, age, sex FROM family_members WHERE id = %s", [member_id])
+                member_data = cur.fetchone()
+                if member_data:
+                    member_info = f"Patient: {member_data['name']} ({member_data['age']}y, {member_data['sex']})"
+        except:
+            member_info = "Patient information unavailable"
+        
+        prompt = f"""
+You are a medical AI assistant summarizing a 15-day health monitoring cycle using structured health data.
+
+CYCLE INFORMATION:
+- Cycle Number: {cycle_number}
+- Duration: {cycle_info['cycle_start'].strftime('%Y-%m-%d')} to {cycle_info['cycle_end'].strftime('%Y-%m-%d')}
+- Total Health Entries: {cycle_info['total_entries']}
+- Medical Reports: {cycle_info['report_count']}
+- Symptom Logs: {cycle_info['symptom_count']}
+- Average Health Score: {f"{avg_score:.1f}/100" if avg_score else "Not calculated"}
+- {member_info}
+
+STRUCTURED HEALTH DATA FROM THIS CYCLE:
+{structured_context}
+
+Please provide a comprehensive medical summary covering:
+
+1. HEALTH TRAJECTORY: Overall progression during this period - improving, stable, or declining?
+
+2. SYMPTOM EVOLUTION: How symptoms changed over time, resolution patterns, new developments.
+
+3. CLINICAL FINDINGS: Key medical findings from reports and their progression.
+
+4. DIAGNOSTIC PATTERNS: Changes in diagnosis or clinical assessment.
+
+5. RISK ASSESSMENT: Any concerning patterns, risk factors, or red flags.
+
+6. POSITIVE DEVELOPMENTS: Improvements, successful management, good health practices.
+
+7. RECOMMENDATIONS: Priority monitoring or actions for next cycle.
+
+Focus on the progression patterns visible in the structured data. Be clinically precise and concise.
+
+Return only the summary text - no JSON, no markdown, no additional explanations.
+"""
+        
+        print(f"📤 Sending structured data prompt to Gemini ({len(prompt)} chars)...")
+        response = model.generate_content(prompt)
+        summary = response.text.strip()
+        
+        # Clean up the summary
+        summary = summary.replace('```', '').strip()
+        if summary.startswith('"') and summary.endswith('"'):
+            summary = summary[1:-1]
+        
+        print(f"✅ AI Summary generated successfully: {len(summary)} characters")
+        print(f"📝 Preview: {summary[:200]}...")
+        
+        return summary
+        
+    except Exception as e:
+        print(f"❌ AI summary generation failed: {e}")
+        print("🔄 Falling back to simple structured summary...")
+        return generate_simple_structured_summary(structured_insights, cycle_info, avg_score)
+def generate_simple_structured_summary(insights, cycle_info, avg_score):
+    """Generate simple summary from structured insights without AI"""
+    print("📝 Generating simple summary from structured data...")
+    
+    summary = f"""HEALTH MONITORING CYCLE #{cycle_info.get('cycle_number', 'N/A')} SUMMARY
+
+CYCLE PERIOD: {cycle_info['cycle_start'].strftime('%Y-%m-%d')} to {cycle_info['cycle_end'].strftime('%Y-%m-%d')}
+
+OVERVIEW:
+• Total health entries: {cycle_info['total_entries']}
+• Medical reports: {cycle_info['report_count']}
+• Symptom logs: {cycle_info['symptom_count']}
+• Average health score: {f"{avg_score:.1f}/100" if avg_score else "Not calculated"}
+
+HEALTH PROGRESSION:
+"""
+    
+    if insights:
+        # Analyze progression patterns
+        symptom_changes = []
+        score_changes = []
+        diagnoses = []
+        
+        for insight in insights[:8]:  # Limit to 8 most recent
+            data = safe_json_parse(insight['insight_data'])
+            seq_num = insight['sequence_number']
+            date_str = insight['created_at'].strftime('%m/%d')
+            
+            # Track symptom changes
+            symptoms = data.get('symptoms', '')
+            if symptoms and symptoms not in ['None', 'No symptoms reported - routine checkup']:
+                symptom_changes.append(f"{date_str}: {symptoms}")
+            
+            # Track health scores
+            score = data.get('health_score')
+            if score:
+                score_changes.append(f"{date_str}: {score}/100")
+            
+            # Track diagnoses
+            diagnosis = data.get('diagnosis', '')
+            if diagnosis and diagnosis not in ['Symptom analysis only', 'Not specified']:
+                diagnoses.append(f"{date_str}: {diagnosis}")
+        
+        if symptom_changes:
+            summary += "\nSYMPTOM TIMELINE:\n"
+            for change in symptom_changes[-3:]:  # Last 3 entries
+                summary += f"• {change}\n"
+        
+        if score_changes:
+            summary += "\nHEALTH SCORES:\n"
+            for score in score_changes[-3:]:  # Last 3 entries
+                summary += f"• {score}\n"
+        
+        if diagnoses:
+            summary += "\nCLINICAL ASSESSMENTS:\n"
+            for diagnosis in diagnoses[-3:]:  # Last 3 entries
+                summary += f"• {diagnosis}\n"
+                
+        if len(insights) > 8:
+            summary += f"\n... and {len(insights) - 8} more entries"
+    else:
+        summary += "\nNo health insights recorded during this period."
+
+    summary += f"""
+
+CYCLE COMPLETION:
+Cycle archiving completed on {datetime.now().strftime('%Y-%m-%d %H:%M')}
+Data source: Structured health insights
+"""
+    
+    print(f"✅ Simple structured summary generated: {len(summary)} characters")
+    return summary
+
+def build_structured_context_for_ai(structured_insights, cycle_info):
+    """Build comprehensive context from structured_insights for AI analysis"""
+    context = "HEALTH DATA PROGRESSION:\n\n"
+    
+    for i, insight in enumerate(structured_insights):
+        data = safe_json_parse(insight['insight_data'])
+        seq_num = insight['sequence_number']
+        insight_type = insight.get('insight_type', 'unknown')
+        created_at = insight['created_at'].strftime('%Y-%m-%d')
+        
+        context += f"ENTRY #{seq_num} ({insight_type}, {created_at}):\n"
+        
+        # Symptoms progression
+        current_symptoms = data.get('symptoms', 'None')
+        previous_symptoms = data.get('previous_symptoms')
+        if previous_symptoms and previous_symptoms != 'None recorded':
+            context += f"  Symptoms: {previous_symptoms} → {current_symptoms}\n"
+        else:
+            context += f"  Symptoms: {current_symptoms}\n"
+        
+        # Health score progression
+        current_score = data.get('health_score')
+        previous_score = data.get('previous_health_score')
+        if current_score:
+            if previous_score:
+                context += f"  Health Score: {previous_score} → {current_score}\n"
+            else:
+                context += f"  Health Score: {current_score}\n"
+        
+        # Diagnosis progression
+        current_diagnosis = data.get('diagnosis')
+        previous_diagnosis = data.get('previous_diagnosis')
+        if current_diagnosis and current_diagnosis != "Symptom analysis only":
+            if previous_diagnosis and previous_diagnosis != "Not specified":
+                context += f"  Diagnosis: {previous_diagnosis} → {current_diagnosis}\n"
+            else:
+                context += f"  Diagnosis: {current_diagnosis}\n"
+        
+        # Key findings
+        reports = data.get('reports')
+        if reports and reports != "None":
+            context += f"  Findings: {reports[:100]}...\n"
+        
+        # Lab summary if available
+        lab_summary = data.get('lab_summary')
+        if lab_summary and lab_summary != "No lab results":
+            context += f"  Labs: {lab_summary}\n"
+        
+        context += "\n"
+    
+    return context
+
+def extract_key_findings_from_structured_insights(insights):
+    """Extract key medical findings from structured insights"""
+    if not insights:
+        return "No significant medical findings recorded during this cycle."
+    
+    findings = []
+    
+    for insight in insights:
+        data = safe_json_parse(insight['insight_data'])
+        
+        # Look for significant changes or findings
+        current_symptoms = data.get('symptoms', '')
+        previous_symptoms = data.get('previous_symptoms', '')
+        health_score = data.get('health_score')
+        previous_score = data.get('previous_health_score')
+        diagnosis = data.get('diagnosis', '')
+        reports = data.get('reports', '')
+        
+        # Significant symptom change
+        if (current_symptoms != previous_symptoms and 
+            current_symptoms not in ['None', 'No symptoms reported - routine checkup'] and
+            previous_symptoms not in ['None recorded', 'None']):
+            findings.append(f"Symptom change: {previous_symptoms} → {current_symptoms}")
+        
+        # Significant health score change
+        if health_score and previous_score and abs(health_score - previous_score) > 10:
+            trend = "improved" if health_score > previous_score else "declined"
+            findings.append(f"Health score {trend}: {previous_score} → {health_score}")
+        
+        # New diagnosis or significant finding
+        if diagnosis and diagnosis != "Symptom analysis only" and diagnosis != "Not specified":
+            if "→" in diagnosis or "improved" in diagnosis.lower() or "resolved" in diagnosis.lower():
+                findings.append(f"Diagnosis update: {diagnosis}")
+        
+        # Significant lab or report findings
+        if reports and reports != "None" and any(keyword in reports.lower() for keyword in 
+                                                ['abnormal', 'elevated', 'high', 'low', 'critical', 'emergency']):
+            findings.append(f"Key finding: {reports[:100]}...")
+    
+    if findings:
+        # Limit to 5 most significant findings
+        return "\n".join(findings[:5])
+    else:
+        return "Routine monitoring with no critical findings identified."
 
 def generate_cycle_summary_with_ai(member_id, cycle_number, insights, cycle_info, avg_score):
     """Generate comprehensive cycle summary using Gemini AI - IMPROVED & ROBUST"""
@@ -3388,7 +3638,7 @@ def check_name_similarity(name1, name2):
     
     # Fuzzy matching with high threshold
     similarity = fuzz.ratio(name1_clean, name2_clean)
-    return similarity >= 50  # 80% similarity threshold
+    return similarity >= 45  # 80% similarity threshold
 
 def validate_report_for_profile(report_text, current_profile):
     """Validate if the report belongs to the current profile - FIXED LOGIC"""
@@ -5029,11 +5279,11 @@ def handle_more_input_selection(selection):
         
     elif selection == "✅ Finish & Save Timeline":
         # Save timeline and end session
-        response = f"## ✅ Timeline Saved for {profile['name']}\n\n"
-        response += f"Your health timeline has been updated with {st.session_state.sequential_analysis_count} input(s).\n\n"
-        response += "### Summary of Insights:\n"
-        response += f"- {st.session_state.temp_insight}\n\n"
-        response += "You can always come back to add more information!"
+        response = f"✅ Timeline Saved for {profile['name']}\n\n"
+        #response += f"Your health timeline has been updated with {st.session_state.sequential_analysis_count} input(s).\n\n"
+        #response += "### Summary of Insights:\n"
+        #response += f"- {st.session_state.temp_insight}\n\n"
+        #response += "You can always come back to add more information!"
         
         add_message("assistant", response, ["🤒 Check Symptoms", "📄 Upload Report", "Both"])
         
@@ -6142,17 +6392,32 @@ def generate_timeline_pdf(profile_id, profile_name):
                 FROM insight_sequence iseq
                 LEFT JOIN medical_reports mr ON iseq.report_id = mr.id
                 WHERE iseq.member_id = %s
-                ORDER BY iseq.sequence_number
             """, (profile_id,))
             sequences = cur.fetchall()
 
         if sequences:
-            seq_data = [["Sequence #", "Insight Type", "Report Date"]]
+            seq_data = [["Sequence #", "Insight Type", "Report Date", "Uploaded At"]]
             for seq in sequences:
-                date_str = seq['report_date'] or seq['created_at'].strftime("%Y-%m-%d")
-                seq_data.append([f"Report {seq['sequence_number']}", seq['insight_type'].title(), date_str])
+                # Handle None values for report_date
+                if seq['report_date']:
+                    date_str = seq['report_date'].strftime("%Y-%m-%d")
+                else:
+                    date_str = "Not specified"
+                
+                # Handle None values for created_at (shouldn't be None, but just in case)
+                if seq['created_at']:
+                    date_cre = seq['created_at'].strftime("%Y-%m-%d")
+                else:
+                    date_cre = "Not specified"
+                
+                seq_data.append([
+                    f"Report {seq['sequence_number']}", 
+                    seq['insight_type'].title(), 
+                    date_str, 
+                    date_cre
+                ])
             
-            seq_table = Table(seq_data, colWidths=[1.5*inch, 2*inch, 1.5*inch])
+            seq_table = Table(seq_data, colWidths=[1.2*inch, 1.8*inch, 1.5*inch, 1.5*inch])
             seq_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -6208,8 +6473,7 @@ def generate_timeline_pdf(profile_id, profile_name):
                 SELECT symptoms_text, severity, created_at
                 FROM symptoms
                 WHERE member_id = %s
-                ORDER BY created_at DESC
-                LIMIT 10
+                ORDER BY created_at 
             """, (profile_id,))
             symptoms = cur.fetchall()
         
@@ -6241,7 +6505,7 @@ def generate_timeline_pdf(profile_id, profile_name):
             cycles = cur.fetchall()
 
         if cycles:
-            cycle_data = [["Cycle #", "Start Date", "End Date", "Reports", "Status"]]
+            cycle_data = [["Cycle #", "Start Date", "End Date", "Reports/symptoms", "Status"]]
             for cycle in cycles:
                 start_date = cycle['cycle_start'].strftime("%Y-%m-%d")
                 end_date = cycle['cycle_end'].strftime("%Y-%m-%d") if cycle['cycle_end'] else "Active"
@@ -6249,7 +6513,7 @@ def generate_timeline_pdf(profile_id, profile_name):
                 status = "Archived" if days_active >= 15 else f"Active ({days_active}/15 days)"
                 cycle_data.append([f"Cycle {cycle['cycle_number']}", start_date, end_date, cycle['report_count'], status])
             
-            cycle_table = Table(cycle_data, colWidths=[1*inch, 1.2*inch, 1.2*inch, 0.8*inch, 1.5*inch])
+            cycle_table = Table(cycle_data, colWidths=[1*inch, 1.2*inch, 1.2*inch, 1.5*inch, 1.5*inch])
             cycle_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 8),
@@ -6262,54 +6526,6 @@ def generate_timeline_pdf(profile_id, profile_name):
             content.append(cycle_table)
         else:
             content.append(Paragraph("No cycle data available.", normal_style))
-        
-        # Structured Insights History
-        # content.append(Paragraph("Structured Health Records", heading_style))
-
-        # In the PDF generation function, replace the structured insights section
-        # with conn.cursor() as cur:
-        #     cur.execute("""
-        #         SELECT sequence_number, insight_data, created_at
-        #         FROM structured_insights 
-        #         WHERE member_id = %s
-        #         ORDER BY sequence_number
-        #     """, (profile_id,))
-        #     structured_insights = cur.fetchall()
-
-        # if structured_insights:
-        #     for insight in structured_insights:
-        #         data = json.loads(insight['insight_data'])
-        #         content.append(Paragraph(f"Record #{insight['sequence_number']} - {insight['created_at'].strftime('%Y-%m-%d')}", heading_style))
-                
-        #         insight_data = [
-        #             ["Symptoms:", data.get('symptoms', 'None')],
-        #             ["Reports:", data.get('reports', 'None')],
-        #             ["Diagnosis:", data.get('diagnosis', 'Not specified')],
-        #             ["Next Steps:", data.get('next_steps', 'Not specified')],
-        #             ["Health Score:", str(data.get('health_score', '')) if data.get('health_score') else "Not calculated"]
-        #         ]
-                
-        #         if data.get('trend'):
-        #             insight_data.append(["Trend:", data['trend']])
-        #         if data.get('risk'):
-        #             insight_data.append(["Risk:", data['risk']])
-        #         if data.get('suggested_action'):
-        #             insight_data.append(["Suggested Action:", data['suggested_action']])
-                
-        #         insight_table = Table(insight_data, colWidths=[1.5*inch, 4*inch])
-        #         insight_table.setStyle(TableStyle([
-        #             ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-        #             ('FONTSIZE', (0, 0), (-1, -1), 9),
-        #             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        #             ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-        #         ]))
-        #         content.append(insight_table)
-        #         content.append(Spacer(1, 0.1*inch))
-        # else:
-        #     content.append(Paragraph("No structured health records available.", normal_style))
-
-
-        # Health Scores Summary
         content.append(Paragraph("Health Score History", heading_style))
         
         with conn.cursor() as cur:
@@ -6355,6 +6571,7 @@ def generate_timeline_pdf(profile_id, profile_name):
         st.error(f"Error generating PDF: {e}")
         return None
     
+
 def main():
     """Main application function"""
     
@@ -6482,4 +6699,3 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
-
