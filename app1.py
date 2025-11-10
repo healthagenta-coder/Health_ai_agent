@@ -42,11 +42,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-            host="localhost",
-            database="Health_med",
-            user="postgres",
-            password="jeet",
-            cursor_factory=RealDictCursor
+          host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+        database="Health_med",
+        user="neondb_owner",
+        password="npg_5GXIK6DrVLHU",
+        cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -6699,3 +6699,4 @@ def main():
                     prompt_profile_completion()
 if __name__ == "__main__":
     main()
+
