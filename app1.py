@@ -509,18 +509,22 @@ def save_user_session(user_info):
     st.session_state.google_id = user_info['google_id']
 
 def logout_user():
-    """Clear user session"""
+    """Clear user session and trigger logout"""
     keys_to_clear = [
         'authenticated', 'user_email', 'user_name', 
         'user_picture', 'google_id', 'current_family',
-        'current_profiles', 'chat_history', 'consent_given'
+        'current_profiles', 'chat_history', 'consent_given',
+        'user_id'
     ]
     for key in keys_to_clear:
         if key in st.session_state:
             del st.session_state[key]
+    
+    # Trigger Streamlit's logout
+    st.session_state.logged_in = False
 
 def create_or_update_user(google_id, email, name, picture_url=None):
-    """Create or update user from Google OAuth"""
+    """Create or update user from Google OAuth - FIXED VERSION"""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -540,7 +544,9 @@ def create_or_update_user(google_id, email, name, picture_url=None):
     except Exception as e:
         conn.rollback()
         st.error(f"Error creating/updating user: {e}")
+        print(f"Database error: {e}")
         return None
+
 
 def get_user_by_google_id(google_id):
     """Get user by Google ID"""
@@ -553,46 +559,57 @@ def get_user_by_google_id(google_id):
         return None
 
 
-def get_or_create_family_by_email(*args):
-    """Temporary fix - handles both old and new calling patterns"""
+def get_or_create_family_by_email(user_info):
+    """Get or create family by email - FIXED VERSION"""
     try:
-        # If called with user_info dict (new OAuth way)
-        if len(args) == 1 and isinstance(args[0], dict):
-            user_info = args[0]
-            email = user_info['email']
-            name = user_info['name']
-        # If called with email and name separately (old way)  
-        elif len(args) == 2:
-            email, name = args
-        else:
-            st.error("Invalid arguments")
-            return None
-            
+        email = user_info['email']
+        name = user_info['name']
+        user_id = user_info.get('id')
+        
         with conn.cursor() as cur:
-            # Use truncated email for phone_number field
+            # Use email as unique identifier
             truncated_email = email[:255]
             
-            cur.execute("SELECT * FROM families WHERE phone_number = %s", (truncated_email,))
+            # Check if family exists with this email
+            cur.execute("""
+                SELECT * FROM families 
+                WHERE phone_number = %s
+            """, (truncated_email,))
             family = cur.fetchone()
             
             if not family:
-                cur.execute(
-                    "INSERT INTO families (phone_number, head_name) VALUES (%s, %s) RETURNING *",
-                    (truncated_email, name)
-                )
+                # Create new family
+                cur.execute("""
+                    INSERT INTO families (user_id, phone_number, head_name) 
+                    VALUES (%s, %s, %s) 
+                    RETURNING *
+                """, (user_id, truncated_email, name))
                 family = cur.fetchone()
                 conn.commit()
                 
                 if family:
+                    # Initialize usage tracking
                     initialize_usage_tracking(family['id'])
+                    print(f"✅ Created new family for {email}")
+            else:
+                # Update user_id if not set
+                if not family.get('user_id') and user_id:
+                    cur.execute("""
+                        UPDATE families 
+                        SET user_id = %s 
+                        WHERE id = %s 
+                        RETURNING *
+                    """, (user_id, family['id']))
+                    family = cur.fetchone()
+                    conn.commit()
             
             return family
             
     except Exception as e:
         conn.rollback()
         st.error(f"Database error: {e}")
+        print(f"Family creation error: {e}")
         return None
-
 
 def get_daily_interaction_count(family_id):
     """Get today's interaction count for a family"""
@@ -1436,6 +1453,58 @@ def process_report_with_symptom_context(profile, report_text, symptoms_text, rep
     )
     
     return insight
+
+
+def initialize_user_from_oauth(user_info):
+    """Initialize user from OAuth login data"""
+    try:
+        # Extract info from st.login response
+        email = user_info.get('email')
+        name = user_info.get('name', email.split('@')[0])
+        picture = user_info.get('picture')
+        google_id = user_info.get('sub') or user_info.get('id', email)
+        
+        print(f"🔐 Initializing user: {email}")
+        
+        # Create or update user in database
+        user = create_or_update_user(
+            google_id=google_id,
+            email=email,
+            name=name,
+            picture_url=picture
+        )
+        
+        if user:
+            # Set session state
+            st.session_state.authenticated = True
+            st.session_state.user_id = user['id']
+            st.session_state.user_email = user['email']
+            st.session_state.user_name = user['name']
+            st.session_state.user_picture = user.get('picture_url')
+            st.session_state.google_id = user['google_id']
+            
+            # Get or create family
+            family = get_or_create_family_by_email(user)
+            if family:
+                st.session_state.current_family = family
+                
+                # Load existing profiles
+                profiles = get_family_members(family['id'])
+                st.session_state.current_profiles = profiles
+                
+                print(f"✅ User initialized: {email}, Family ID: {family['id']}")
+                return True
+            else:
+                st.error("Failed to create/retrieve family profile")
+                return False
+        else:
+            st.error("Failed to create/update user")
+            return False
+            
+    except Exception as e:
+        st.error(f"Error initializing user: {e}")
+        print(f"User initialization error: {e}")
+        return False
 
 def get_contextual_insight(report_text, symptoms_text, symptom_date, last_report_context, carried_forward, profile, report_date=None):
     """Get insight with proper context handling"""
@@ -5672,19 +5741,19 @@ def finalize_report_processing(profile):
 # UI Components
 
 def render_user_info_sidebar():
-    """Render user info in sidebar"""
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("### 👤 Account Info")
-        
-        # if st.session_state.user_picture:
-        #     st.image(st.session_state.user_picture, width=60)
-        
-        st.write(f"**{st.session_state.user_name}**")
-        st.markdown(
-    f"<p>📧 {st.session_state.user_email}</p>",
-    unsafe_allow_html=True
-)
+    """Render user info in sidebar with logout"""
+    st.markdown("---")
+    st.markdown("### 👤 Account Info")
+    
+    if st.session_state.user_picture:
+        st.image(st.session_state.user_picture, width=60)
+    
+    st.write(f"**{st.session_state.user_name}**")
+    st.markdown(f"<p>📧 {st.session_state.user_email}</p>", unsafe_allow_html=True)
+    
+    if st.button("🚪 Sign Out", use_container_width=True):
+        logout_user()
+        st.rerun()
 
         
         if st.button("🚪 Sign Out", use_container_width=True):
@@ -6972,14 +7041,84 @@ def render_delete_confirmation():
 
 
 def main():
-    """Main application function"""
+    """Main application function with st.login"""
     
-    # Check authentication first
-    if not st.session_state.authenticated:
-        render_google_login()
+    # ============================================
+    # AUTHENTICATION CHECK using st.login
+    # ============================================
+    
+    # Check if already authenticated in session
+    if not st.session_state.get('authenticated', False):
+        # Show login page
+        st.title("🏥 Health AI Agent")
+        st.write("Welcome! Please sign in to continue")
+        
+        # Use Streamlit's built-in login
+        if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
+            # This will trigger OAuth flow in a popup (not iframe)
+            try:
+                # Method 1: Using st.experimental_user (if available in your Streamlit version)
+                if hasattr(st, 'experimental_user'):
+                    user_info = st.experimental_user
+                    if user_info and user_info.get('email'):
+                        if initialize_user_from_oauth(user_info):
+                            st.rerun()
+                
+                # Method 2: Manual OAuth with proper redirect (fallback)
+                else:
+                    st.info("""
+                    **To enable Google Sign-In:**
+                    
+                    1. Upgrade Streamlit: `pip install streamlit --upgrade`
+                    2. Or use the manual setup below
+                    """)
+                    
+                    # Show manual OAuth instructions
+                    with st.expander("📖 Manual Setup Instructions"):
+                        st.markdown("""
+                        Since your Streamlit version doesn't support `st.experimental_user`, 
+                        you'll need to set up OAuth manually:
+                        
+                        1. **Get OAuth credentials from Google Cloud Console**
+                        2. **Add to Streamlit secrets**
+                        3. **Deploy and test**
+                        
+                        Contact support if you need help!
+                        """)
+            except Exception as e:
+                st.error(f"Login error: {e}")
+        
+        st.info("💡 Your email will be used as your account identifier")
+        
+        # Add alternative: Email-based authentication (temporary workaround)
+        st.divider()
+        st.subheader("🔑 Alternative: Email Login")
+        with st.form("email_login"):
+            email = st.text_input("Enter your email", placeholder="your.email@example.com")
+            name = st.text_input("Enter your name", placeholder="Your Name")
+            
+            if st.form_submit_button("Continue with Email", type="secondary"):
+                if email and name and '@' in email:
+                    # Create temporary user
+                    user_info = {
+                        'email': email,
+                        'name': name,
+                        'id': email,
+                        'sub': email,
+                        'picture': None
+                    }
+                    if initialize_user_from_oauth(user_info):
+                        st.success(f"✅ Welcome, {name}!")
+                        st.rerun()
+                else:
+                    st.error("Please enter valid email and name")
+        
+        st.warning("⚠️ Email login is temporary. Use Google Sign-In for production.")
         return
     
-    # User is authenticated, proceed with normal flow
+    # ============================================
+    # USER IS AUTHENTICATED - PROCEED WITH APP
+    # ============================================
     
     # Check if user is first-time
     is_first_time_user = (st.session_state.current_family and 
@@ -6999,149 +7138,89 @@ def main():
     if not st.session_state.chat_history and st.session_state.current_family and st.session_state.consent_given:
         handle_welcome()
     
-    # Check if user is first-time (has family but no profiles and hasn't given consent)
-    
     # Check for delete confirmation modal
     if hasattr(st.session_state, 'delete_confirm_profile') and st.session_state.delete_confirm_profile:
         render_delete_confirmation()
-        return  # Stop further execution until confirmation is handled
+        return
     
-    # Check if user is first-time (has family but no profiles and hasn't given consent)
-    is_first_time_user = (st.session_state.current_family and 
-                         not st.session_state.current_profiles and 
-                         not st.session_state.consent_given)
-    
-    # Show consent modal only for first-time users
-    if is_first_time_user:
-        st.session_state.show_consent_modal = True
-    
-    # Render consent modal if needed
-    if st.session_state.show_consent_modal:
-        render_consent_modal()
-        return  # Stop further execution until consent is given
-    
-    # Initialize welcome message if chat is empty and consent is given
-    if not st.session_state.chat_history and st.session_state.current_family and st.session_state.consent_given:
-        handle_welcome()
-    
-    # Show appropriate interface
-    if not st.session_state.current_family:
-        render_google_login()
+    # Check for profile completion mode
+    if hasattr(st.session_state, 'current_completing_profile') and st.session_state.current_completing_profile:
+        profile = st.session_state.current_completing_profile
+        if render_profile_completion(profile['id'], profile['name']):
+            del st.session_state.current_completing_profile
+            st.rerun()
+        
+        if st.button("← Back to Chat"):
+            del st.session_state.current_completing_profile
+            st.rerun()
     else:
-        # Check for profile completion mode
-        if hasattr(st.session_state, 'current_completing_profile') and st.session_state.current_completing_profile:
-            profile = st.session_state.current_completing_profile
-            if render_profile_completion(profile['id'], profile['name']):
-                # Profile completed, return to chat
-                del st.session_state.current_completing_profile
-                st.rerun()
-            
-            if st.button("← Back to Chat"):
-                del st.session_state.current_completing_profile
-                st.rerun()
-        else:
-            render_chat_interface()
-            
-            # Show profiles and completion prompts in sidebar
-            if st.session_state.current_profiles:
-                with st.sidebar:
-                    render_user_info_sidebar()    
-                    st.subheader("👥 Family Profiles")
-                    display_usage_status()
-                    check_and_show_limit_reset()
-                    # Different colors for different family members
-                    colors = ["#e6f3ff", "#fff0e6", "#e6ffe6", "#f0e6ff", "#fffae6"]
-
-                    for i, profile in enumerate(st.session_state.current_profiles):
-                        color = colors[i % len(colors)]
-                        
-                        # Get latest health score
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute("""
-                                    SELECT final_score FROM health_scores 
-                                    WHERE member_id = %s 
-                                    ORDER BY created_at DESC 
-                                    LIMIT 1
-                                """, (profile['id'],))
-                                latest_score = cur.fetchone()
-                                score_display = f"🏥 {latest_score['final_score']:.1f}/100" if latest_score else "🏥 --/100"
-                        except:
-                            score_display = "🏥 --/100"
-                        
-                        # Create the profile card with download button integrated
-                        card_html = f"""
+        # Main chat interface
+        render_chat_interface()
+        
+        # Show profiles and completion prompts in sidebar
+        if st.session_state.current_profiles:
+            with st.sidebar:
+                render_user_info_sidebar()
+                st.subheader("👥 Family Profiles")
+                display_usage_status()
+                check_and_show_limit_reset()
+                
+                # Display profiles (your existing code)
+                colors = ["#e6f3ff", "#fff0e6", "#e6ffe6", "#f0e6ff", "#fffae6"]
+                for i, profile in enumerate(st.session_state.current_profiles):
+                    color = colors[i % len(colors)]
+                    
+                    # Get latest health score
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                SELECT final_score FROM health_scores 
+                                WHERE member_id = %s 
+                                ORDER BY created_at DESC 
+                                LIMIT 1
+                            """, (profile['id'],))
+                            latest_score = cur.fetchone()
+                            score_display = f"🏥 {latest_score['final_score']:.1f}/100" if latest_score else "🏥 --/100"
+                    except:
+                        score_display = "🏥 --/100"
+                    
+                    # Profile card
+                    card_html = f"""
                     <div style="background-color: {color}; padding: 10px; border-radius: 10px; margin: 10px 0; border-left: 4px solid #4CAF50;">
                         <div style="display: flex; align-items: center; justify-content: space-between;">
-                            <div style="display: flex; align-items: center; flex-grow: 1;">
-                                <div style="flex-grow: 1;">
-                                    <h4 style="margin: 0; color: #333;">{profile['name']}</h4>
-                                    <p style="margin: 0; color: #666;">Age: {profile['age']} years | Gender: {profile['sex']}</p>
-                                    <p style="margin: 0; color: #666; font-weight: bold;">{score_display}</p>
-                                </div>
-                            </div>
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <span style="font-size: 17px;">
-                                    {'👶' if profile['age'] < 2 else 
-                                    '👧' if profile['sex'].lower() == 'female' and profile['age'] < 5 else 
-                                    '👦' if profile['sex'].lower() == 'male' and profile['age'] < 5 else 
-                                    '👧' if profile['sex'].lower() == 'female' and profile['age'] < 12 else 
-                                    '👦' if profile['sex'].lower() == 'male' and profile['age'] < 12 else 
-                                    '👩' if profile['sex'].lower() == 'female' and profile['age'] < 20 else 
-                                    '👨' if profile['sex'].lower() == 'male' and profile['age'] < 20 else 
-                                    '👩‍💼' if profile['sex'].lower() == 'female' and profile['age'] < 40 else 
-                                    '👨‍💼' if profile['sex'].lower() == 'male' and profile['age'] < 40 else 
-                                    '👩‍🔧' if profile['sex'].lower() == 'female' and profile['age'] < 60 else 
-                                    '👨‍🔧' if profile['sex'].lower() == 'male' and profile['age'] < 60 else 
-                                    '👩‍🦳' if profile['sex'].lower() == 'female' and profile['age'] < 75 else 
-                                    '👨‍🦳' if profile['sex'].lower() == 'male' and profile['age'] < 75 else 
-                                    '👵' if profile['sex'].lower() == 'female' else 
-                                    '👴'}
-                                </span>
+                            <div style="flex-grow: 1;">
+                                <h4 style="margin: 0; color: #333;">{profile['name']}</h4>
+                                <p style="margin: 0; color: #666;">Age: {profile['age']} years | Gender: {profile['sex']}</p>
+                                <p style="margin: 0; color: #666; font-weight: bold;">{score_display}</p>
                             </div>
                         </div>
                     </div>
                     """
-                        st.markdown(card_html, unsafe_allow_html=True)
-                        # Download button integrated within the card area
-                        # Download and Delete buttons side by side
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            if st.button("📥 Download", 
-                                       key=f"download_{profile['id']}", 
-                                       help=f"Download {profile['name']}'s health timeline PDF",
-                                       use_container_width=True):
-                                with st.spinner(f"Generating PDF for {profile['name']}..."):
-                                    pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
-                                    
-                                    if pdf_data:
-                                        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-                                        st.download_button(
-                                            label="Download Now",
-                                            data=pdf_data,
-                                            file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
-                                            mime="application/pdf",
-                                            key=f"pdf_download_{profile['id']}",
-                                            use_container_width=True
-                                        )
-                                    else:
-                                        st.error("Failed to generate PDF")
-                        
-                        with col2:
-                            if st.button("🗑️ Delete", 
-                                       key=f"delete_{profile['id']}", 
-                                       help=f"Delete {profile['name']}'s profile",
-                                       use_container_width=True,
-                                       type="secondary"):
-                                # Store profile info for confirmation
-                                st.session_state.delete_confirm_profile = profile
-                                st.rerun()
-                        
-                        # Add spacing between profiles
-                        st.markdown("<div style='margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+                    st.markdown(card_html, unsafe_allow_html=True)
                     
-                    prompt_profile_completion()
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("📥 Download", key=f"download_{profile['id']}", use_container_width=True):
+                            with st.spinner(f"Generating PDF for {profile['name']}..."):
+                                pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
+                                if pdf_data:
+                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+                                    st.download_button(
+                                        label="Download Now",
+                                        data=pdf_data,
+                                        file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
+                                        mime="application/pdf",
+                                        key=f"pdf_download_{profile['id']}",
+                                        use_container_width=True
+                                    )
+                    
+                    with col2:
+                        if st.button("🗑️ Delete", key=f"delete_{profile['id']}", use_container_width=True):
+                            st.session_state.delete_confirm_profile = profile
+                            st.rerun()
+                
+                prompt_profile_completion()
+
 
 if __name__ == "__main__":
     main()
