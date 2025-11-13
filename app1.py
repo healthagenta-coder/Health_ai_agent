@@ -37,7 +37,7 @@ st.set_page_config(
 
 GOOGLE_CLIENT_ID = "156087244287-f2b0fu9hnurovipvl528liaq1q4rs50v.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET = "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"
-REDIRECT_URI = "https://healthaiagent.streamlit.app"  # Change to your deployed URL in production
+REDIRECT_URI = "https://healthaiagent.streamlit.app/"  # Change to your deployed URL in production
 
 SCOPES = [
     "openid",
@@ -7084,5 +7084,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
