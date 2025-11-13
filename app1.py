@@ -18,6 +18,15 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from datetime import datetime
 from rapidfuzz import fuzz
+
+import google.auth.transport.requests
+import google.oauth2.id_token
+from google.auth.transport import requests as google_requests
+from google_auth_oauthlib.flow import Flow
+import json
+import os
+
+
 # Page configuration
 st.set_page_config(
     page_title="Health AI Agent",
@@ -25,6 +34,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+GOOGLE_CLIENT_ID = "156087244287-f2b0fu9hnurovipvl528liaq1q4rs50v.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "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"
+REDIRECT_URI = "http://localhost:8501"  # Change to your deployed URL in production
+
+SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile"
+]
 
 # Initialize Gemini - Check if API key is valid
 GEMINI_API_KEY = "AIzaSyBEsdTrIaVyQvPm-MdoYNkyWuDBOPIwwmw"
@@ -42,11 +61,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-          host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -65,14 +84,16 @@ def init_db():
                 
                 # Create families table
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS families (
-                        id SERIAL PRIMARY KEY,
-                        phone_number VARCHAR(20) UNIQUE NOT NULL,
-                        head_name VARCHAR(100) NOT NULL,
-                        region VARCHAR(100),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+    CREATE TABLE IF NOT EXISTS families (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        phone_number VARCHAR(20),
+        head_name VARCHAR(100) NOT NULL,
+        family_name VARCHAR(255),
+        region VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
                 
                 # Create insight_sequence table to track report sequence
 # Replace the insight_sequence table in init_db()
@@ -232,6 +253,17 @@ def init_db():
                         UNIQUE(member_id, flag_type)
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        google_id VARCHAR(255) UNIQUE NOT NULL,
+                        email VARCHAR(255) UNIQUE NOT NULL,
+                        name VARCHAR(255) NOT NULL,
+                        picture_url TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
                 
                 conn.commit()
         except Exception as e:
@@ -271,6 +303,11 @@ def init_session_state():
         "pending_both": False,
         "previous_flow": None,  # For the track of sysmptoms first
         "symptoms_first_triggered": False,  # NEW: More specific flag
+        "authenticated": False,
+        "user_email": None,
+        "user_name": None,
+        "user_picture": None,
+        "google_id": None,
     }
     
     for key, value in defaults.items():
@@ -343,6 +380,184 @@ def render_consent_modal():
 - Privacy policy may change; we will notify users
 - Continued use after updates implies acceptance""")
 # Utility functions
+
+
+# here are all Google OAUTH
+
+def create_google_oauth_flow():
+    """Create Google OAuth flow"""
+    try:
+        client_config = {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uris": [REDIRECT_URI],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        }
+        
+        flow = Flow.from_client_config(
+            client_config=client_config,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+        return flow
+    except Exception as e:
+        st.error(f"Error creating OAuth flow: {e}")
+        return None
+
+def get_google_auth_url():
+    """Get Google OAuth authorization URL"""
+    try:
+        flow = create_google_oauth_flow()
+        if flow:
+            authorization_url, state = flow.authorization_url(
+                access_type='offline',
+                include_granted_scopes='true',
+                prompt='consent'
+            )
+            return authorization_url, state
+        return None, None
+    except Exception as e:
+        st.error(f"Error getting auth URL: {e}")
+        return None, None
+
+def handle_google_callback(code):
+    """Handle Google OAuth callback and get user info"""
+    try:
+        flow = create_google_oauth_flow()
+        if not flow:
+            return None
+        
+        # Exchange authorization code for tokens
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # Get user info
+        request = google_requests.Request()
+        id_info = google.oauth2.id_token.verify_oauth2_token(
+            credentials.id_token,
+            request,
+            GOOGLE_CLIENT_ID
+        )
+        
+        # Create or update user in database
+        user = create_or_update_user(
+            google_id=id_info.get('sub'),
+            email=id_info.get('email'),
+            name=id_info.get('name'),
+            picture_url=id_info.get('picture')
+        )
+        
+        if user:
+            return {
+                'user_id': user['id'],
+                'google_id': user['google_id'],
+                'email': user['email'],
+                'name': user['name'],
+                'picture': user['picture_url']
+            }
+        return None
+        
+    except Exception as e:
+        st.error(f"Error handling callback: {e}")
+        return None
+
+def save_user_session(user_info):
+    """Save user session in session state"""
+    st.session_state.authenticated = True
+    st.session_state.user_id = user_info['user_id']
+    st.session_state.user_email = user_info['email']
+    st.session_state.user_name = user_info['name']
+    st.session_state.user_picture = user_info.get('picture')
+    st.session_state.google_id = user_info['google_id']
+
+def logout_user():
+    """Clear user session"""
+    keys_to_clear = [
+        'authenticated', 'user_email', 'user_name', 
+        'user_picture', 'google_id', 'current_family',
+        'current_profiles', 'chat_history', 'consent_given'
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+def create_or_update_user(google_id, email, name, picture_url=None):
+    """Create or update user from Google OAuth"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (google_id, email, name, picture_url, last_login)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (google_id) 
+                DO UPDATE SET 
+                    email = EXCLUDED.email,
+                    name = EXCLUDED.name,
+                    picture_url = EXCLUDED.picture_url,
+                    last_login = CURRENT_TIMESTAMP
+                RETURNING *
+            """, (google_id, email, name, picture_url))
+            user = cur.fetchone()
+            conn.commit()
+            return user
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error creating/updating user: {e}")
+        return None
+
+def get_user_by_google_id(google_id):
+    """Get user by Google ID"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE google_id = %s", (google_id,))
+            return cur.fetchone()
+    except Exception as e:
+        st.error(f"Error fetching user: {e}")
+        return None
+
+
+def get_or_create_family_by_email(*args):
+    """Temporary fix - handles both old and new calling patterns"""
+    try:
+        # If called with user_info dict (new OAuth way)
+        if len(args) == 1 and isinstance(args[0], dict):
+            user_info = args[0]
+            email = user_info['email']
+            name = user_info['name']
+        # If called with email and name separately (old way)  
+        elif len(args) == 2:
+            email, name = args
+        else:
+            st.error("Invalid arguments")
+            return None
+            
+        with conn.cursor() as cur:
+            # Use truncated email for phone_number field
+            truncated_email = email[:255]
+            
+            cur.execute("SELECT * FROM families WHERE phone_number = %s", (truncated_email,))
+            family = cur.fetchone()
+            
+            if not family:
+                cur.execute(
+                    "INSERT INTO families (phone_number, head_name) VALUES (%s, %s) RETURNING *",
+                    (truncated_email, name)
+                )
+                family = cur.fetchone()
+                conn.commit()
+                
+                if family:
+                    initialize_usage_tracking(family['id'])
+            
+            return family
+            
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Database error: {e}")
+        return None
+
 
 def get_daily_interaction_count(family_id):
     """Get today's interaction count for a family"""
@@ -869,8 +1084,7 @@ def extract_lab_summary(labs_data):
         else:
             summary_parts.append(f"{test_name}: {result}")
     
-    return "; ".join(summary_parts) if summary_parts else "All labs normal"
-
+    return "; ".join(summary_parts) if summary_parts else "All labs normal" 
 
 def format_insight_for_comparison(insight_data):
     """
@@ -5421,11 +5635,32 @@ def finalize_report_processing(profile):
         # Clear the temp report text
         st.session_state.temp_report_text = ""
 # UI Components
+
+def render_user_info_sidebar():
+    """Render user info in sidebar"""
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 👤 Account Info")
+        
+        # if st.session_state.user_picture:
+        #     st.image(st.session_state.user_picture, width=60)
+        
+        st.write(f"**{st.session_state.user_name}**")
+        st.markdown(
+    f"<p>📧 {st.session_state.user_email}</p>",
+    unsafe_allow_html=True
+)
+
+        
+        if st.button("🚪 Sign Out", use_container_width=True):
+            logout_user()
+            st.rerun()
+
 def render_chat_interface():
     """Render the main chat interface"""
     # Header with family info
     if st.session_state.current_family:
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2, col3= st.columns([2, 1, 1])
         with col1:
             st.header("💬 Health Assistant")
         with col2:
@@ -5434,18 +5669,21 @@ def render_chat_interface():
         with col3:
             if st.button("🔄 Reset Chat"):
                 st.session_state.chat_history = []
-                # Clear the active profile so it asks for selection again
                 st.session_state.temp_profile = None
                 st.session_state.temp_insight = ""
                 st.session_state.sequential_analysis_count = 0
                 st.session_state.pending_input_type = None
                 st.session_state.pending_both_returning = False
                 st.session_state.bot_state = "welcome"
-                # Clear file processing flags
                 if 'last_processed_file' in st.session_state:
                     del st.session_state.last_processed_file
                 handle_welcome()
                 st.rerun()
+        # with col4:
+        #     # ADD LOGOUT BUTTON
+        #     if st.button("🚪 Logout"):
+        #         logout_user()
+        #         st.rerun()
     else:
         st.header("💬 Health Assistant")
     
@@ -6242,72 +6480,69 @@ def prompt_profile_completion():
                 st.session_state.current_completing_profile = profile
                 st.rerun()
 
-def render_phone_or_create_profile():
-    """Render login/create profile interface"""
+def render_google_login():
+    """Render Google OAuth login interface"""
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.title("🏥 Health AI Agent")
-        st.write("Enter your phone number to get started")
+        st.write("Sign in with your Google account to continue")
         
-        # Check if we're in create family mode
-        if "create_family_mode" not in st.session_state:
-            st.session_state.create_family_mode = False
+        # Display user info if available
+        if st.session_state.user_picture:
+            st.image(st.session_state.user_picture, width=100)
         
-        if not st.session_state.create_family_mode:
-            # Phone number input form
-            with st.form("phone_input", clear_on_submit=False):
-                phone_number = st.text_input("Phone Number", placeholder="Enter your phone number")
-                if st.form_submit_button("Continue"):
-                    if phone_number:
-                        family = get_family_by_phone(phone_number)
-                        if family:
-                            st.session_state.current_family = family
-                            # Load existing profiles
-                            profiles = get_family_members(family['id'])
-                            st.session_state.current_profiles = profiles
-                            
-                            handle_welcome()
-                            st.rerun()
-                        else:
-                            # Set create family mode and store phone
-                            st.session_state.create_family_mode = True
-                            st.session_state.pending_phone = phone_number
-                            st.rerun()
+        if st.session_state.user_name:
+            st.write(f"Welcome, {st.session_state.user_name}!")
+        
+        # Check for OAuth callback code in URL
+        query_params = st.query_params
+        
+        if 'code' in query_params:
+            with st.spinner("Signing in..."):
+                # Handle OAuth callback
+                code = query_params['code']
+                user_info = handle_google_callback(code)
+                
+                if user_info:
+                    # Save session
+                    save_user_session(user_info)
+                    
+                    # Get or create family
+                    family = get_or_create_family_by_email(user_info)
+                    
+                    if family:
+                        st.session_state.current_family = family
+                        
+                        # Load existing profiles
+                        profiles = get_family_members(family['id'])
+                        st.session_state.current_profiles = profiles
+                        
+                        # Clear URL parameters
+                        st.query_params.clear()
+                        
+                        # Initialize chat
+                        handle_welcome()
+                        st.rerun()
                     else:
-                        st.error("Please enter a phone number")
+                        st.error("Failed to create/retrieve your profile")
+                else:
+                    st.error("Failed to sign in with Google")
         
-        else:
-            # Create family form (separate from phone input)
-            st.info("New phone number! Let's create your profile.")
+        # Show login button if not authenticated
+        if not st.session_state.authenticated:
+            st.markdown("<br>", unsafe_allow_html=True)
             
-            with st.form("create_family", clear_on_submit=False):
-                head_name = st.text_input("Your Name", placeholder="Enter your name")
-                # region = st.text_input("City/Region (optional)", placeholder="Your city (optional)")
-                
-                col_create, col_back = st.columns(2)
-                with col_create:
-                    create_clicked = st.form_submit_button("Create Profile")
-                with col_back:
-                    back_clicked = st.form_submit_button("← Back")
-                
-                if create_clicked:
-                    if head_name:
-                        family = create_family(st.session_state.pending_phone, head_name)
-                        if family:
-                            st.session_state.current_family = family
-                            st.session_state.current_profiles = []
-                            st.session_state.create_family_mode = False
-                            
-                            handle_welcome()
-                            st.rerun()
-                        else:
-                            st.error("Failed to create profile. Please try again.")
-                    else:
-                        st.error("Please enter your name.")
-                
-                if back_clicked:
-                    st.session_state.create_family_mode = False
-                    st.rerun()
+            if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
+                auth_url, state = get_google_auth_url()
+                if auth_url:
+                    st.session_state.oauth_state = state
+                    # Redirect to Google OAuth
+                    st.markdown(f'<meta http-equiv="refresh" content="0;url={auth_url}">', 
+                              unsafe_allow_html=True)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.info("💡 **Note:** Your email will be used as your account identifier")
+
 def generate_timeline_pdf(profile_id, profile_name):
     """Generate a PDF timeline for a specific profile"""
     try:
@@ -6571,9 +6806,144 @@ def generate_timeline_pdf(profile_id, profile_name):
         st.error(f"Error generating PDF: {e}")
         return None
     
+def delete_family_member(member_id):
+    """Delete a family member and all associated data"""
+    try:
+        with conn.cursor() as cur:
+            # The CASCADE in the database schema will automatically delete:
+            # - medical_reports
+            # - symptoms
+            # - member_habits
+            # - member_diseases
+            # - health_scores
+            # - insight_history
+            # - insight_sequence
+            # - structured_insights
+            
+            cur.execute("DELETE FROM family_members WHERE id = %s", (member_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        st.error(f"Error deleting profile: {e}")
+        conn.rollback()
+        return False
+
+def render_delete_confirmation():
+    """Render delete confirmation modal"""
+    if hasattr(st.session_state, 'delete_confirm_profile') and st.session_state.delete_confirm_profile:
+        profile = st.session_state.delete_confirm_profile
+        
+        # Create modal overlay
+        st.markdown("""
+        <style>
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 9999;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Center the content
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col2:
+            st.markdown("## ⚠️ Confirm Deletion")
+            st.markdown("---")
+            
+            st.warning(f"""
+            ### Are you sure you want to delete {profile['name']}'s profile?
+            
+            **This action will permanently delete:**
+            - All medical reports
+            - All symptom records
+            - All health insights
+            - All health scores
+            - Complete medical history
+            
+            **This action CANNOT be undone!**
+            """)
+            
+            # Buttons
+            col_delete, col_cancel = st.columns(2)
+            
+            with col_delete:
+                if st.button("🗑️ Yes, Delete Profile", type="primary", use_container_width=True):
+                    if delete_family_member(profile['id']):
+                        # Remove from current profiles
+                        st.session_state.current_profiles = [
+                            p for p in st.session_state.current_profiles 
+                            if p['id'] != profile['id']
+                        ]
+                        
+                        # Clear temp profile if it was the deleted one
+                        if hasattr(st.session_state, 'temp_profile') and st.session_state.temp_profile:
+                            if st.session_state.temp_profile['id'] == profile['id']:
+                                st.session_state.temp_profile = None
+                        
+                        # Show success message
+                        st.success(f"✅ {profile['name']}'s profile has been deleted successfully.")
+                        
+                        # Clear confirmation state
+                        del st.session_state.delete_confirm_profile
+                        
+                        # Reset chat if no profiles left
+                        if not st.session_state.current_profiles:
+                            st.session_state.chat_history = []
+                            st.session_state.bot_state = "welcome"
+                            handle_welcome()
+                        
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete profile. Please try again.")
+            
+            with col_cancel:
+                if st.button("❌ Cancel", use_container_width=True):
+                    del st.session_state.delete_confirm_profile
+                    st.rerun()
+
 
 def main():
     """Main application function"""
+    
+    # Check authentication first
+    if not st.session_state.authenticated:
+        render_google_login()
+        return
+    
+    # User is authenticated, proceed with normal flow
+    
+    # Check if user is first-time
+    is_first_time_user = (st.session_state.current_family and 
+                         not st.session_state.current_profiles and 
+                         not st.session_state.consent_given)
+    
+    # Show consent modal only for first-time users
+    if is_first_time_user:
+        st.session_state.show_consent_modal = True
+    
+    # Render consent modal if needed
+    if st.session_state.show_consent_modal:
+        render_consent_modal()
+        return
+    
+    # Initialize welcome message if chat is empty and consent is given
+    if not st.session_state.chat_history and st.session_state.current_family and st.session_state.consent_given:
+        handle_welcome()
+    
+    # Check if user is first-time (has family but no profiles and hasn't given consent)
+    
+    # Check for delete confirmation modal
+    if hasattr(st.session_state, 'delete_confirm_profile') and st.session_state.delete_confirm_profile:
+        render_delete_confirmation()
+        return  # Stop further execution until confirmation is handled
     
     # Check if user is first-time (has family but no profiles and hasn't given consent)
     is_first_time_user = (st.session_state.current_family and 
@@ -6595,7 +6965,7 @@ def main():
     
     # Show appropriate interface
     if not st.session_state.current_family:
-        render_phone_or_create_profile()
+        render_google_login()
     else:
         # Check for profile completion mode
         if hasattr(st.session_state, 'current_completing_profile') and st.session_state.current_completing_profile:
@@ -6613,7 +6983,8 @@ def main():
             
             # Show profiles and completion prompts in sidebar
             if st.session_state.current_profiles:
-                with st.sidebar:    
+                with st.sidebar:
+                    render_user_info_sidebar()    
                     st.subheader("👥 Family Profiles")
                     display_usage_status()
                     check_and_show_limit_reset()
@@ -6672,31 +7043,44 @@ def main():
                     """
                         st.markdown(card_html, unsafe_allow_html=True)
                         # Download button integrated within the card area
-                        if st.button("📥 Download Timeline", 
-                                   key=f"download_{profile['id']}", 
-                                   help=f"Download {profile['name']}'s health timeline PDF",
-                                   use_container_width=True):
-                            with st.spinner(f"Generating PDF for {profile['name']}..."):
-                                pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
-                                
-                                if pdf_data:
-                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-                                    st.download_button(
-                                        label="Download Now",
-                                        data=pdf_data,
-                                        file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
-                                        mime="application/pdf",
-                                        key=f"pdf_download_{profile['id']}",
-                                        use_container_width=True
-                                    )
-                                else:
-                                    st.error("Failed to generate PDF")
+                        # Download and Delete buttons side by side
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            if st.button("📥 Download", 
+                                       key=f"download_{profile['id']}", 
+                                       help=f"Download {profile['name']}'s health timeline PDF",
+                                       use_container_width=True):
+                                with st.spinner(f"Generating PDF for {profile['name']}..."):
+                                    pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
+                                    
+                                    if pdf_data:
+                                        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+                                        st.download_button(
+                                            label="Download Now",
+                                            data=pdf_data,
+                                            file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
+                                            mime="application/pdf",
+                                            key=f"pdf_download_{profile['id']}",
+                                            use_container_width=True
+                                        )
+                                    else:
+                                        st.error("Failed to generate PDF")
+                        
+                        with col2:
+                            if st.button("🗑️ Delete", 
+                                       key=f"delete_{profile['id']}", 
+                                       help=f"Delete {profile['name']}'s profile",
+                                       use_container_width=True,
+                                       type="secondary"):
+                                # Store profile info for confirmation
+                                st.session_state.delete_confirm_profile = profile
+                                st.rerun()
                         
                         # Add spacing between profiles
                         st.markdown("<div style='margin-bottom: 15px;'></div>", unsafe_allow_html=True)
-    
-                    # Prompt for incomplete profiles
+                    
                     prompt_profile_completion()
+
 if __name__ == "__main__":
     main()
-
