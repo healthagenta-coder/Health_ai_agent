@@ -35,7 +35,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 GOOGLE_CLIENT_ID = "156087244287-f2b0fu9hnurovipvl528liaq1q4rs50v.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET = "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"
 REDIRECT_URI = "https://healthaiagent.streamlit.app"  # Change to your deployed URL in production
@@ -62,11 +61,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-          host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
-        database="Health_med",
-        user="neondb_owner",
-        password="npg_5GXIK6DrVLHU",
-        cursor_factory=RealDictCursor
+            host="localhost",
+            database="Health_med",
+            user="postgres",
+            password="jeet",
+            cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -386,15 +385,21 @@ def render_consent_modal():
 # here are all Google OAUTH
 
 def create_google_oauth_flow():
-    """Create Google OAuth flow"""
+    """Create Google OAuth flow with proper error handling"""
     try:
+        # Validate credentials
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            st.error("⚠️ OAuth credentials not configured. Please check Streamlit secrets.")
+            return None
+            
         client_config = {
             "web": {
                 "client_id": GOOGLE_CLIENT_ID,
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "redirect_uris": [REDIRECT_URI],
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token"
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
             }
         }
         
@@ -403,30 +408,53 @@ def create_google_oauth_flow():
             scopes=SCOPES,
             redirect_uri=REDIRECT_URI
         )
+        
+        # Disable HTTPS check for local development only
+        if "localhost" in REDIRECT_URI or "127.0.0.1" in REDIRECT_URI:
+            import os
+            os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+        
         return flow
     except Exception as e:
-        st.error(f"Error creating OAuth flow: {e}")
+        st.error(f"❌ Error creating OAuth flow: {e}")
+        print(f"OAuth Flow Error: {e}")
         return None
 
+
+
 def get_google_auth_url():
-    """Get Google OAuth authorization URL"""
+    """Get Google OAuth authorization URL with state verification"""
     try:
         flow = create_google_oauth_flow()
-        if flow:
-            authorization_url, state = flow.authorization_url(
-                access_type='offline',
-                include_granted_scopes='true',
-                prompt='consent'
-            )
-            return authorization_url, state
-        return None, None
+        if not flow:
+            return None, None
+        
+        # Generate a random state for CSRF protection
+        import secrets
+        state = secrets.token_urlsafe(32)
+        
+        authorization_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent',
+            state=state
+        )
+        
+        return authorization_url, state
     except Exception as e:
-        st.error(f"Error getting auth URL: {e}")
+        st.error(f"❌ Error getting auth URL: {e}")
+        print(f"Auth URL Error: {e}")
         return None, None
 
-def handle_google_callback(code):
-    """Handle Google OAuth callback and get user info"""
+def handle_google_callback(code, state):
+    """Handle Google OAuth callback with state verification"""
     try:
+        # Verify state to prevent CSRF
+        if 'oauth_state' in st.session_state:
+            if state != st.session_state.oauth_state:
+                st.error("⚠️ Invalid OAuth state. Possible security issue.")
+                return None
+        
         flow = create_google_oauth_flow()
         if not flow:
             return None
@@ -442,6 +470,10 @@ def handle_google_callback(code):
             request,
             GOOGLE_CLIENT_ID
         )
+        
+        # Clear the state after successful verification
+        if 'oauth_state' in st.session_state:
+            del st.session_state.oauth_state
         
         # Create or update user in database
         user = create_or_update_user(
@@ -462,8 +494,10 @@ def handle_google_callback(code):
         return None
         
     except Exception as e:
-        st.error(f"Error handling callback: {e}")
+        st.error(f"❌ Error handling OAuth callback: {e}")
+        print(f"Callback Error: {e}")
         return None
+
 
 def save_user_session(user_info):
     """Save user session in session state"""
@@ -6482,27 +6516,22 @@ def prompt_profile_completion():
                 st.rerun()
 
 def render_google_login():
-    """Render Google OAuth login interface"""
+    """Render Google OAuth login interface with better error handling"""
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.title("🏥 Health AI Agent")
         st.write("Sign in with your Google account to continue")
         
-        # Display user info if available
-        if st.session_state.user_picture:
-            st.image(st.session_state.user_picture, width=100)
-        
-        if st.session_state.user_name:
-            st.write(f"Welcome, {st.session_state.user_name}!")
-        
         # Check for OAuth callback code in URL
         query_params = st.query_params
         
         if 'code' in query_params:
+            code = query_params.get('code')
+            state = query_params.get('state', '')
+            
             with st.spinner("Signing in..."):
-                # Handle OAuth callback
-                code = query_params['code']
-                user_info = handle_google_callback(code)
+                # Handle OAuth callback with state verification
+                user_info = handle_google_callback(code, state)
                 
                 if user_info:
                     # Save session
@@ -6525,24 +6554,55 @@ def render_google_login():
                         handle_welcome()
                         st.rerun()
                     else:
-                        st.error("Failed to create/retrieve your profile")
+                        st.error("❌ Failed to create/retrieve your profile")
                 else:
-                    st.error("Failed to sign in with Google")
+                    st.error("❌ Failed to sign in with Google. Please try again.")
+                    # Clear URL parameters on error
+                    st.query_params.clear()
         
         # Show login button if not authenticated
         if not st.session_state.authenticated:
             st.markdown("<br>", unsafe_allow_html=True)
             
-            if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
-                auth_url, state = get_google_auth_url()
-                if auth_url:
-                    st.session_state.oauth_state = state
-                    # Redirect to Google OAuth
-                    st.markdown(f'<meta http-equiv="refresh" content="0;url={auth_url}">', 
-                              unsafe_allow_html=True)
+            # Check if OAuth is properly configured
+            if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+                st.error("⚠️ **OAuth Not Configured**")
+                st.info("""
+                Please configure Google OAuth credentials:
+                1. Go to Streamlit Cloud Settings
+                2. Add secrets for `google_oauth.client_id` and `google_oauth.client_secret`
+                3. Restart the app
+                """)
+            else:
+                if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
+                    auth_url, state = get_google_auth_url()
+                    if auth_url and state:
+                        # Store state for verification
+                        st.session_state.oauth_state = state
+                        # Use JavaScript redirect instead of meta refresh
+                        st.markdown(
+                            f"""
+                            <script>
+                                window.location.href = "{auth_url}";
+                            </script>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.error("❌ Could not generate OAuth URL. Check configuration.")
             
             st.markdown("<br>", unsafe_allow_html=True)
             st.info("💡 **Note:** Your email will be used as your account identifier")
+            
+            # Debug info for troubleshooting (remove in production)
+            if st.checkbox("Show debug info"):
+                st.code(f"""
+                Client ID configured: {bool(GOOGLE_CLIENT_ID)}
+                Client Secret configured: {bool(GOOGLE_CLIENT_SECRET)}
+                Redirect URI: {REDIRECT_URI}
+                Current URL params: {dict(st.query_params)}
+                """)
+
 
 def generate_timeline_pdf(profile_id, profile_name):
     """Generate a PDF timeline for a specific profile"""
@@ -7085,9 +7145,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
