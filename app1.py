@@ -18,6 +18,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from datetime import datetime
 from rapidfuzz import fuzz
+from secrets import token_urlsafe
 
 import google.auth.transport.requests
 import google.oauth2.id_token
@@ -61,7 +62,7 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-         host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+        host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
         database="Health_med",
         user="neondb_owner",
         password="npg_5GXIK6DrVLHU",
@@ -498,6 +499,114 @@ def handle_google_callback(code, state):
         print(f"Callback Error: {e}")
         return None
 
+def render_login_page():
+    """Render login page with Google OAuth"""
+    
+    # Check for OAuth callback
+    query_params = st.query_params
+    
+    # Handle OAuth callback
+    if 'code' in query_params and 'state' in query_params:
+        with st.spinner("Signing in..."):
+            code = query_params['code']
+            state = query_params['state']
+            
+            user_info = handle_oauth_callback(code, state)
+            
+            if user_info:
+                if initialize_user_session(user_info):
+                    # Clear query params
+                    st.query_params.clear()
+                    # Initialize welcome
+                    handle_welcome()
+                    st.rerun()
+                else:
+                    st.error("Failed to initialize user session")
+            else:
+                st.error("OAuth authentication failed")
+            
+            # Clear params on error
+            if st.button("Try Again"):
+                st.query_params.clear()
+                st.rerun()
+        return
+    
+    # Show login UI
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("🏥 Health AI Agent")
+        st.markdown("---")
+        st.subheader("Welcome!")
+        st.write("Sign in to manage your family's health timeline")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Check if OAuth is configured
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            st.error("⚠️ **Google OAuth Not Configured**")
+            st.info("""
+            **To enable Google Sign-In:**
+            
+            1. Go to Streamlit Cloud → App Settings → Secrets
+            2. Add:
+            ```
+            [google_oauth]
+            client_id = "YOUR_CLIENT_ID"
+            client_secret = "YOUR_SECRET"
+            redirect_uri = "YOUR_APP_URL"
+            ```
+            3. Restart the app
+            """)
+            
+            st.divider()
+            st.subheader("🔑 Temporary Email Login")
+            with st.form("temp_login"):
+                email = st.text_input("Email", placeholder="your@email.com")
+                name = st.text_input("Name", placeholder="Your Name")
+                if st.form_submit_button("Continue", use_container_width=True):
+                    if email and name and '@' in email:
+                        user_info = {
+                            'google_id': email,
+                            'email': email,
+                            'name': name,
+                            'picture': None
+                        }
+                        if initialize_user_session(user_info):
+                            st.success("Logged in!")
+                            st.rerun()
+                    else:
+                        st.error("Invalid email or name")
+        else:
+            # Google Sign-In Button
+            if st.button("🔐 Sign in with Google", type="primary", use_container_width=True, key="google_signin"):
+                auth_url, state = get_auth_url()
+                
+                if auth_url and state:
+                    # Store state in session
+                    st.session_state.oauth_state = state
+                    
+                    # Use JavaScript to redirect
+                    redirect_script = f"""
+                        <script type="text/javascript">
+                            window.location.href = "{auth_url}";
+                        </script>
+                    """
+                    st.components.v1.html(redirect_script, height=0)
+                    st.info("🔄 Redirecting to Google...")
+                else:
+                    st.error("❌ Failed to generate login URL. Check your OAuth configuration.")
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.info("💡 **Your email will be used as your account identifier**")
+            
+            # Debug info (optional)
+            with st.expander("🔧 Debug Info"):
+                st.code(f"""
+OAuth Configured: {bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)}
+Client ID: {GOOGLE_CLIENT_ID[:20]}... (truncated)
+Redirect URI: {REDIRECT_URI}
+Query Params: {dict(query_params)}
+                """)
 
 def save_user_session(user_info):
     """Save user session in session state"""
@@ -509,12 +618,12 @@ def save_user_session(user_info):
     st.session_state.google_id = user_info['google_id']
 
 def logout_user():
-    """Clear user session and trigger logout"""
+    """Clear user session"""
     keys_to_clear = [
         'authenticated', 'user_email', 'user_name', 
         'user_picture', 'google_id', 'current_family',
         'current_profiles', 'chat_history', 'consent_given',
-        'user_id'
+        'user_id', 'oauth_state'
     ]
     for key in keys_to_clear:
         if key in st.session_state:
@@ -523,8 +632,43 @@ def logout_user():
     # Trigger Streamlit's logout
     st.session_state.logged_in = False
 
+def initialize_user_session(user_info):
+    """Initialize user session after successful login"""
+    try:
+        # Create/update user in database
+        user = create_or_update_user(
+            google_id=user_info['google_id'],
+            email=user_info['email'],
+            name=user_info['name'],
+            picture_url=user_info.get('picture')
+        )
+        
+        if not user:
+            return False
+        
+        # Set session state
+        st.session_state.authenticated = True
+        st.session_state.user_id = user['id']
+        st.session_state.user_email = user['email']
+        st.session_state.user_name = user['name']
+        st.session_state.user_picture = user.get('picture_url')
+        st.session_state.google_id = user['google_id']
+        
+        # Get or create family
+        family = get_or_create_family_by_email({'email': user['email'], 'name': user['name'], 'id': user['id']})
+        if family:
+            st.session_state.current_family = family
+            profiles = get_family_members(family['id'])
+            st.session_state.current_profiles = profiles
+            return True
+        
+        return False
+    except Exception as e:
+        st.error(f"Session initialization failed: {e}")
+        return False
+
 def create_or_update_user(google_id, email, name, picture_url=None):
-    """Create or update user from Google OAuth - FIXED VERSION"""
+    """Create or update user in database"""
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -543,10 +687,8 @@ def create_or_update_user(google_id, email, name, picture_url=None):
             return user
     except Exception as e:
         conn.rollback()
-        st.error(f"Error creating/updating user: {e}")
-        print(f"Database error: {e}")
+        st.error(f"Database error: {e}")
         return None
-
 
 def get_user_by_google_id(google_id):
     """Get user by Google ID"""
@@ -5741,24 +5883,20 @@ def finalize_report_processing(profile):
 # UI Components
 
 def render_user_info_sidebar():
-    """Render user info in sidebar with logout"""
+    """Render user info with logout"""
     st.markdown("---")
-    st.markdown("### 👤 Account Info")
+    st.markdown("### 👤 Account")
     
     if st.session_state.user_picture:
         st.image(st.session_state.user_picture, width=60)
     
     st.write(f"**{st.session_state.user_name}**")
-    st.markdown(f"<p>📧 {st.session_state.user_email}</p>", unsafe_allow_html=True)
+    st.caption(st.session_state.user_email)
     
     if st.button("🚪 Sign Out", use_container_width=True):
         logout_user()
         st.rerun()
 
-        
-        if st.button("🚪 Sign Out", use_container_width=True):
-            logout_user()
-            st.rerun()
 
 def render_chat_interface():
     """Render the main chat interface"""
@@ -6958,6 +7096,86 @@ def delete_family_member(member_id):
         conn.rollback()
         return False
 
+def handle_oauth_callback(code, state):
+    """Handle OAuth callback and return user info"""
+    # Verify state
+    if 'oauth_state' not in st.session_state or st.session_state.oauth_state != state:
+        st.error("⚠️ Invalid OAuth state - possible security issue")
+        return None
+    
+    flow = create_oauth_flow()
+    if not flow:
+        return None
+    
+    try:
+        # Exchange code for credentials
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # Verify and get user info
+        request = google_requests.Request()
+        id_info = google.oauth2.id_token.verify_oauth2_token(
+            credentials.id_token,
+            request,
+            GOOGLE_CLIENT_ID
+        )
+        
+        return {
+            'google_id': id_info.get('sub'),
+            'email': id_info.get('email'),
+            'name': id_info.get('name'),
+            'picture': id_info.get('picture')
+        }
+    except Exception as e:
+        st.error(f"OAuth callback failed: {e}")
+        return None
+
+def get_auth_url():
+    """Generate OAuth authorization URL"""
+    flow = create_oauth_flow()
+    if not flow:
+        return None, None
+    
+    try:
+        state = token_urlsafe(32)
+        authorization_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent',
+            state=state
+        )
+        return authorization_url, state
+    except Exception as e:
+        st.error(f"Failed to generate auth URL: {e}")
+        return None, None
+
+def create_oauth_flow():
+    """Create OAuth flow - returns None if credentials not configured"""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return None
+    
+    try:
+        client_config = {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uris": [REDIRECT_URI],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        }
+        
+        flow = Flow.from_client_config(
+            client_config=client_config,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+        return flow
+    except Exception as e:
+        st.error(f"OAuth flow creation failed: {e}")
+        return None
+
+
 def render_delete_confirmation():
     """Render delete confirmation modal"""
     if hasattr(st.session_state, 'delete_confirm_profile') and st.session_state.delete_confirm_profile:
@@ -7041,109 +7259,38 @@ def render_delete_confirmation():
 
 
 def main():
-    """Main application function with st.login"""
+    """Main application function"""
     
-    # ============================================
-    # AUTHENTICATION CHECK using st.login
-    # ============================================
-    
-    # Check if already authenticated in session
+    # Check authentication
     if not st.session_state.get('authenticated', False):
-        # Show login page
-        st.title("🏥 Health AI Agent")
-        st.write("Welcome! Please sign in to continue")
-        
-        # Use Streamlit's built-in login
-        if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
-            # This will trigger OAuth flow in a popup (not iframe)
-            try:
-                # Method 1: Using st.experimental_user (if available in your Streamlit version)
-                if hasattr(st, 'experimental_user'):
-                    user_info = st.experimental_user
-                    if user_info and user_info.get('email'):
-                        if initialize_user_from_oauth(user_info):
-                            st.rerun()
-                
-                # Method 2: Manual OAuth with proper redirect (fallback)
-                else:
-                    st.info("""
-                    **To enable Google Sign-In:**
-                    
-                    1. Upgrade Streamlit: `pip install streamlit --upgrade`
-                    2. Or use the manual setup below
-                    """)
-                    
-                    # Show manual OAuth instructions
-                    with st.expander("📖 Manual Setup Instructions"):
-                        st.markdown("""
-                        Since your Streamlit version doesn't support `st.experimental_user`, 
-                        you'll need to set up OAuth manually:
-                        
-                        1. **Get OAuth credentials from Google Cloud Console**
-                        2. **Add to Streamlit secrets**
-                        3. **Deploy and test**
-                        
-                        Contact support if you need help!
-                        """)
-            except Exception as e:
-                st.error(f"Login error: {e}")
-        
-        st.info("💡 Your email will be used as your account identifier")
-        
-        # Add alternative: Email-based authentication (temporary workaround)
-        st.divider()
-        st.subheader("🔑 Alternative: Email Login")
-        with st.form("email_login"):
-            email = st.text_input("Enter your email", placeholder="your.email@example.com")
-            name = st.text_input("Enter your name", placeholder="Your Name")
-            
-            if st.form_submit_button("Continue with Email", type="secondary"):
-                if email and name and '@' in email:
-                    # Create temporary user
-                    user_info = {
-                        'email': email,
-                        'name': name,
-                        'id': email,
-                        'sub': email,
-                        'picture': None
-                    }
-                    if initialize_user_from_oauth(user_info):
-                        st.success(f"✅ Welcome, {name}!")
-                        st.rerun()
-                else:
-                    st.error("Please enter valid email and name")
-        
-        st.warning("⚠️ Email login is temporary. Use Google Sign-In for production.")
+        render_login_page()
         return
     
-    # ============================================
-    # USER IS AUTHENTICATED - PROCEED WITH APP
-    # ============================================
+    # User is authenticated - proceed with app
     
     # Check if user is first-time
     is_first_time_user = (st.session_state.current_family and 
                          not st.session_state.current_profiles and 
-                         not st.session_state.consent_given)
+                         not st.session_state.get('consent_given', False))
     
-    # Show consent modal only for first-time users
+    # Show consent modal for first-time users
     if is_first_time_user:
         st.session_state.show_consent_modal = True
     
-    # Render consent modal if needed
-    if st.session_state.show_consent_modal:
+    if st.session_state.get('show_consent_modal', False):
         render_consent_modal()
         return
     
-    # Initialize welcome message if chat is empty and consent is given
-    if not st.session_state.chat_history and st.session_state.current_family and st.session_state.consent_given:
+    # Initialize welcome message
+    if not st.session_state.chat_history and st.session_state.current_family and st.session_state.get('consent_given', False):
         handle_welcome()
     
-    # Check for delete confirmation modal
+    # Check for modals
     if hasattr(st.session_state, 'delete_confirm_profile') and st.session_state.delete_confirm_profile:
         render_delete_confirmation()
         return
     
-    # Check for profile completion mode
+    # Check for profile completion
     if hasattr(st.session_state, 'current_completing_profile') and st.session_state.current_completing_profile:
         profile = st.session_state.current_completing_profile
         if render_profile_completion(profile['id'], profile['name']):
@@ -7157,7 +7304,7 @@ def main():
         # Main chat interface
         render_chat_interface()
         
-        # Show profiles and completion prompts in sidebar
+        # Sidebar with profiles
         if st.session_state.current_profiles:
             with st.sidebar:
                 render_user_info_sidebar()
@@ -7165,7 +7312,7 @@ def main():
                 display_usage_status()
                 check_and_show_limit_reset()
                 
-                # Display profiles (your existing code)
+                # Display profiles
                 colors = ["#e6f3ff", "#fff0e6", "#e6ffe6", "#f0e6ff", "#fffae6"]
                 for i, profile in enumerate(st.session_state.current_profiles):
                     color = colors[i % len(colors)]
@@ -7185,14 +7332,22 @@ def main():
                         score_display = "🏥 --/100"
                     
                     # Profile card
+                    emoji = ('👶' if profile['age'] < 2 else 
+                            '👧' if profile['sex'].lower() == 'female' and profile['age'] < 12 else 
+                            '👦' if profile['sex'].lower() == 'male' and profile['age'] < 12 else 
+                            '👩' if profile['sex'].lower() == 'female' and profile['age'] < 40 else 
+                            '👨' if profile['sex'].lower() == 'male' and profile['age'] < 40 else 
+                            '👵' if profile['sex'].lower() == 'female' else '👴')
+                    
                     card_html = f"""
                     <div style="background-color: {color}; padding: 10px; border-radius: 10px; margin: 10px 0; border-left: 4px solid #4CAF50;">
                         <div style="display: flex; align-items: center; justify-content: space-between;">
                             <div style="flex-grow: 1;">
                                 <h4 style="margin: 0; color: #333;">{profile['name']}</h4>
-                                <p style="margin: 0; color: #666;">Age: {profile['age']} years | Gender: {profile['sex']}</p>
+                                <p style="margin: 0; color: #666;">Age: {profile['age']} | Gender: {profile['sex']}</p>
                                 <p style="margin: 0; color: #666; font-weight: bold;">{score_display}</p>
                             </div>
+                            <span style="font-size: 24px;">{emoji}</span>
                         </div>
                     </div>
                     """
@@ -7200,28 +7355,24 @@ def main():
                     
                     col1, col2 = st.columns(2)
                     with col1:
-                        if st.button("📥 Download", key=f"download_{profile['id']}", use_container_width=True):
-                            with st.spinner(f"Generating PDF for {profile['name']}..."):
+                        if st.button("📥", key=f"download_{profile['id']}", use_container_width=True):
+                            with st.spinner("Generating..."):
                                 pdf_data = generate_timeline_pdf(profile['id'], profile['name'])
                                 if pdf_data:
-                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
                                     st.download_button(
-                                        label="Download Now",
-                                        data=pdf_data,
-                                        file_name=f"health_timeline_{profile['name']}_{timestamp}.pdf",
-                                        mime="application/pdf",
-                                        key=f"pdf_download_{profile['id']}",
+                                        "Download",
+                                        pdf_data,
+                                        f"timeline_{profile['name']}.pdf",
+                                        "application/pdf",
+                                        key=f"dl_{profile['id']}",
                                         use_container_width=True
                                     )
-                    
                     with col2:
-                        if st.button("🗑️ Delete", key=f"delete_{profile['id']}", use_container_width=True):
+                        if st.button("🗑️", key=f"delete_{profile['id']}", use_container_width=True):
                             st.session_state.delete_confirm_profile = profile
                             st.rerun()
                 
                 prompt_profile_completion()
 
-
 if __name__ == "__main__":
     main()
-
