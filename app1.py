@@ -35,27 +35,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-def get_redirect_uri():
-    """Get the appropriate redirect URI based on environment"""
-    try:
-        # Check if we're running on Streamlit Cloud
-        if os.environ.get('STREAMLIT_SHARING', '').lower() == 'true':
-            return "https://healthaiagent.streamlit.app"
-        # Check for other deployment indicators
-        elif 'STREAMLIT_SERVER_BASE_URL_PATH' in os.environ:
-            return "https://healthaiagent.streamlit.app"
-        elif 'STREAMLIT_DEPLOYMENT' in os.environ:
-            return "https://healthaiagent.streamlit.app"
-        else:
-            # Local development
-            return "http://localhost:8501"
-    except:
-        # Fallback to production
-        return "https://healthaiagent.streamlit.app"
 
 GOOGLE_CLIENT_ID = "156087244287-f2b0fu9hnurovipvl528liaq1q4rs50v.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET = "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"
-REDIRECT_URI = get_redirect_uri()  # Change to your deployed URL in production
+REDIRECT_URI = "https://healthaiagent.streamlit.app"  # Change to your deployed URL in production
 
 SCOPES = [
     "openid",
@@ -7102,6 +7085,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
