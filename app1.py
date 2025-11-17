@@ -62,11 +62,11 @@ else:
 def init_connection():
     try:
         conn = psycopg2.connect(
-            host="localhost",
-            database="Health_med",
-            user="postgres",
-            password="jeet",
-            cursor_factory=RealDictCursor
+         host="ep-hidden-poetry-add08si2-pooler.c-2.us-east-1.aws.neon.tech",
+        database="Health_med",
+        user="neondb_owner",
+        password="npg_5GXIK6DrVLHU",
+        cursor_factory=RealDictCursor
         )
         return conn
     except Exception as e:
@@ -5201,6 +5201,7 @@ def handle_symptoms_for_both_returning(symptoms_text):
     response = f"## 📊 Comprehensive Insight for {profile['name']}\n\n"
     response += f"{insight_text}\n\n"
     response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
+    response += f"{format_health_score_for_chat(health_scores)}\n"
     response += "### What would you like to do next?"
     
     buttons = ["📄 Add Another Report", "🤒 Add More Symptoms", "Both", "✅ Finish & Save Timeline"]
@@ -5277,7 +5278,7 @@ def process_report_directly(profile, report_text):
         symptoms_to_store, 
         labs_data
     )
-    display_health_score_breakdown(health_scores)
+    #display_health_score_breakdown(health_scores)
     # Save health scores
     try:
         with conn.cursor() as cur:
@@ -5387,6 +5388,7 @@ def process_report_directly(profile, report_text):
     
     response += f"{insight_text}\n\n"
     response += f"🏥 **Health Score: {health_scores['final_score']:.1f}/100**\n\n"
+    response += f"{format_health_score_for_chat(health_scores)}\n"
     response += "### What would you like to do next?"
     
     buttons = ["📄 Add Another Report", "🤒 Add Symptoms", "Both", "✅ Finish & Save Timeline"]
@@ -6605,30 +6607,49 @@ def render_google_login():
             st.markdown("<br>", unsafe_allow_html=True)
             st.info("💡 **Note:** Your email will be used as your account identifier")
 # here is the Health Score 
-def display_health_score_breakdown(health_scores):
+def format_health_score_for_chat(health_scores):
     """
-    Display health score in a single compact line
-    """
-    st.markdown("---")
+    Format health score breakdown for display in chat messages
     
+    Args:
+        health_scores: Dictionary containing all health score components
+    
+    Returns:
+        Formatted string with health score breakdown
+    """
     final_score = health_scores['final_score']
-    score_color = "#4CAF50" if final_score >= 70 else "#FF9800" if final_score >= 55 else "#F44336"
     
-    # Single line with all info
-    st.markdown(f"""
-    <div style="display: flex; align-items: center; justify-content: space-between; font-size: 12px; padding: 5px 0;">
-        <div style="display: flex; align-items: center; gap: 8px;">
-            <span style="font-weight: bold;">📊 Health:</span>
-            <span style="color: {score_color}; font-weight: bold;">{final_score:.1f}/100</span>
-        </div>
-        <div style="display: flex; align-items: center; gap: 12px;">
-            <span title="Labs">🧪 {health_scores['labs_vitals_score']:.0f}</span>
-            <span title="Symptoms">🤒 {health_scores['symptoms_score']:.0f}</span>
-            <span title="Adherence">💊 {health_scores['treatment_adherence_score']:.0f}</span>
-            <span title="Lifestyle">🏃 {health_scores['lifestyle_score']:.0f}</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Determine score color/emoji
+    if final_score >= 80:
+        score_emoji = "🟢"
+        score_status = "Excellent"
+    elif final_score >= 70:
+        score_emoji = "🟡"
+        score_status = "Good"
+    elif final_score >= 55:
+        score_emoji = "🟠"
+        score_status = "Fair"
+    else:
+        score_emoji = "🔴"
+        score_status = "Needs Attention"
+    
+    # Build the formatted string
+    score_text = f"""---
+**📊 Health Score: {score_emoji} {final_score:.1f}/100** ({score_status})
+
+**Score Breakdown:**
+- 🧪 Labs & Vitals: {health_scores['labs_vitals_score']:.0f}/40
+- 🤒 Symptoms: {health_scores['symptoms_score']:.0f}/10
+- 📋 Demographics: {health_scores['demographics_score']:.0f}/8
+- 📁 Upload Logs: {health_scores['upload_logs_score']:.0f}/8
+- 🏥 Diseases & Habits: {health_scores['diseases_habits_score']:.0f}/12
+- 💊 Treatment Adherence: {health_scores['treatment_adherence_score']:.0f}/10
+- 🏃 Lifestyle: {health_scores['lifestyle_score']:.0f}/10
+
+---"""
+    
+    return score_text
+
 
 def score_card(label, score, max_score, emoji):
     """
